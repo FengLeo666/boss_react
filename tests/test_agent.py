@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,11 +10,18 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphDrained
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.runtime import RunControl
 
+from boss_react import cli as cli_module
 from boss_react.agent import build_agent, build_initial_messages, build_model
 from boss_react.agent_config import load_agent_settings
-from boss_react.cli import display_checkpoint_history, resolve_task
+from boss_react.cli import display_checkpoint_history, resolve_task, run
 from boss_react.context_compaction import (
     COMPACTION_PROMPT,
     AgentNodeCompactionMiddleware,
@@ -110,7 +119,7 @@ async def test_empty_configured_task_prompts_for_input(
 
 
 async def test_interactive_task_accepts_multiple_lines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     settings = load_agent_settings(_write_config(tmp_path))
 
@@ -123,6 +132,7 @@ async def test_interactive_task_accepts_multiple_lines(
     )
 
     assert await resolve_task(settings) == "Find Agent roles\nOnly campus recruitment"
+    assert "[输入] 已收到。" in capsys.readouterr().out
 
 
 async def test_cli_override_wins_over_configured_task(tmp_path: Path) -> None:
@@ -351,3 +361,392 @@ async def test_compactor_returns_to_agent_model_after_rewriting_context() -> Non
     assert result["messages"][1].content == "current task"
     assert "compressed history" in result["messages"][2].content
     assert result["messages"][3].content == "finished current task"
+
+
+async def test_manual_compaction_stops_before_normal_agent_work_and_can_resume(tmp_path: Path) -> None:
+    config = {"configurable": {"thread_id": "manual-compact-test"}}
+    database = tmp_path / "checkpoints.sqlite"
+    middleware = AgentNodeCompactionMiddleware(trigger_tokens=1_000_000)
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        first = create_agent(
+            FakeMessagesListChatModel(responses=[AIMessage(content="first run complete")]),
+            middleware=[middleware], checkpointer=saver,
+        )
+        await first.ainvoke(
+            {"messages": [resume_message("resume"), task_message("find work")], "manual_compact": False},
+            config=config,
+        )
+
+        compression_model = FakeMessagesListChatModel(responses=[
+            AIMessage(content="compressed history"), AIMessage(content="should not run"),
+        ])
+        compact = create_agent(compression_model, middleware=[middleware], checkpointer=saver)
+        result = await compact.ainvoke({"manual_compact": True}, config=config)
+        assert compression_model.i == 1
+        assert result["manual_compact"] is False
+        assert [message.content for message in result["messages"]] == [
+            "resume", "find work", "以下是压缩后的历史上下文：\n\ncompressed history",
+        ]
+
+        resumed = create_agent(
+            FakeMessagesListChatModel(responses=[AIMessage(content="continued")]),
+            middleware=[middleware], checkpointer=saver,
+        )
+        continuation = await resumed.ainvoke({"messages": [task_message("new human input")]}, config=config)
+        assert continuation["messages"][-1].content == "continued"
+
+
+async def test_cli_loops_after_agent_end_and_manual_compaction_waits_for_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(tmp_path, task="first task")
+    calls: list[dict] = []
+    inputs = iter(["/compact", "second task", "/exit"])
+
+    class Saver:
+        def __init__(self):
+            self.messages = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def setup(self):
+            return None
+
+        async def aget_tuple(self, _config):
+            if not self.messages:
+                return None
+            return SimpleNamespace(
+                checkpoint={"channel_values": {"messages": self.messages}},
+                config={"configurable": {"checkpoint_id": "test"}},
+            )
+
+    saver = Saver()
+
+    class Graph:
+        async def ainvoke(self, update, config, **_kwargs):
+            calls.append(update)
+            if update.get("manual_compact"):
+                saver.messages = [*saver.messages[:2], HumanMessage(content="summary")]
+            else:
+                saver.messages = [*saver.messages, *update["messages"], AIMessage(content="done")]
+            return {"messages": saver.messages}
+
+        async def astream(self, update, config, **_kwargs):
+            result = await self.ainvoke(update, config)
+            yield {"type": "updates", "data": {"model": {"messages": [result["messages"][-1]]}}}
+
+    class Browser:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    browser = Browser()
+
+    async def next_input():
+        return next(inputs)
+
+    monkeypatch.setattr("boss_react.cli.configure_logging", lambda *_args: None)
+    monkeypatch.setattr("boss_react.cli.AsyncSqliteSaver.from_conn_string", lambda *_args: saver)
+    monkeypatch.setattr("boss_react.cli.build_agent", lambda *_args, **_kwargs: (Graph(), browser))
+    monkeypatch.setattr("boss_react.cli._read_next_input", next_input)
+
+    code = await run(argparse.Namespace(config=config_path, task=None))
+
+    assert code == 0
+    assert len(calls) == 3
+    assert calls[0]["messages"][1].content == "first task"
+    assert calls[1] == {"manual_compact": True}
+    assert calls[2]["messages"][0].content == "second task"
+    assert browser.closed is True
+
+
+async def test_escape_key_requests_graph_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    import msvcrt
+
+    monkeypatch.setattr(
+        cli_module, "sys",
+        SimpleNamespace(platform="win32", stdin=SimpleNamespace(isatty=lambda: True)),
+    )
+    monkeypatch.setattr(msvcrt, "kbhit", lambda: True)
+    monkeypatch.setattr(msvcrt, "getwch", lambda: "\x1b")
+    control = RunControl()
+
+    await cli_module._watch_escape(control)
+
+    assert control.drain_requested
+    assert control.drain_reason == "user_escape"
+
+
+async def test_graph_drain_saves_checkpoint_and_can_resume() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def first(_state):
+        entered.set()
+        await release.wait()
+        return {"value": 1}
+
+    async def second(_state):
+        return {"value": 2}
+
+    builder = StateGraph(dict)
+    builder.add_node("first", first)
+    builder.add_node("second", second)
+    builder.add_edge(START, "first")
+    builder.add_edge("first", "second")
+    builder.add_edge("second", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "escape-test"}}
+    control = RunControl()
+    run_task = asyncio.create_task(graph.ainvoke({"value": 0}, config, control=control))
+
+    await entered.wait()
+    control.request_drain("user_escape")
+    release.set()
+    with pytest.raises(GraphDrained):
+        await run_task
+
+    state = await graph.aget_state(config)
+    assert state.values["value"] == 1
+    assert state.next == ("second",)
+    assert (await graph.ainvoke(None, config))["value"] == 2
+
+
+async def test_new_cli_input_after_drain_does_not_execute_pending_tool() -> None:
+    control = RunControl()
+    tool_calls = []
+
+    @tool
+    def pending_action() -> str:
+        """A pending action that should not run after user interruption."""
+        tool_calls.append(True)
+        return "done"
+
+    class ToolModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, *args, **kwargs):
+            if self.i == 0:
+                control.request_drain("user_escape")
+            return super()._generate(*args, **kwargs)
+
+    model = ToolModel(responses=[
+        AIMessage(content="", tool_calls=[{"name": "pending_action", "args": {}, "id": "call-1"}]),
+        AIMessage(content="new task acknowledged"),
+    ])
+    graph = create_agent(model, tools=[pending_action], checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "pending-action-test"}}
+
+    with pytest.raises(GraphDrained):
+        await graph.ainvoke({"messages": [HumanMessage(content="old task")]}, config, control=control)
+    assert (await graph.aget_state(config)).next == ("tools",)
+
+    await cli_module._close_pending_tool_calls(graph, config)
+    saved = await graph.aget_state(config)
+    assert saved.next == ("model",)
+    assert isinstance(saved.values["messages"][-1], ToolMessage)
+    assert saved.values["messages"][-1].tool_call_id == "call-1"
+
+    result = await graph.ainvoke({"messages": [HumanMessage(content="new task")]}, config)
+    assert result["messages"][-1].content == "new task acknowledged"
+    assert not tool_calls
+
+
+async def test_cli_escape_returns_to_input_and_stops_forever_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    config_path = _write_config(tmp_path, task="/run forever")
+    calls: list[dict] = []
+    inputs = iter(["second task", "/exit"])
+
+    class Saver:
+        messages = [resume_message("resume"), task_message("original task")]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def setup(self):
+            return None
+
+        async def aget_tuple(self, _config):
+            return SimpleNamespace(
+                checkpoint={"channel_values": {"messages": self.messages}},
+                config={"configurable": {"checkpoint_id": "test"}},
+            )
+
+    saver = Saver()
+
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(next=(), values={"messages": saver.messages})
+
+        async def astream(self, update, config, *, control, **_kwargs):
+            calls.append(update)
+            saver.messages = [*saver.messages, *update["messages"]]
+            if len(calls) == 1:
+                while not control.drain_requested:
+                    await asyncio.sleep(0.01)
+                raise GraphDrained("user_escape")
+            saver.messages.append(AIMessage(content="done"))
+            yield {"type": "updates", "data": {"model": {"messages": [saver.messages[-1]]}}}
+
+    class Browser:
+        async def aclose(self):
+            return None
+
+    watch_count = 0
+
+    async def watch_escape(control):
+        nonlocal watch_count
+        watch_count += 1
+        if watch_count == 1:
+            control.request_drain("user_escape")
+        else:
+            await asyncio.Event().wait()
+
+    async def next_input():
+        return next(inputs)
+
+    monkeypatch.setattr(cli_module, "configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli_module.AsyncSqliteSaver, "from_conn_string", lambda *_args: saver)
+    monkeypatch.setattr(cli_module, "build_agent", lambda *_args, **_kwargs: (Graph(), Browser()))
+    monkeypatch.setattr(cli_module, "_watch_escape", watch_escape)
+    monkeypatch.setattr(cli_module, "_read_next_input", next_input)
+
+    assert await run(argparse.Namespace(config=config_path, task=None)) == 0
+    assert len(calls) == 2
+    assert calls[0]["messages"][0].content.startswith("继续执行")
+    assert calls[1]["messages"][0].content == "second task"
+    assert "已暂停，返回输入。" in capsys.readouterr().out
+
+
+async def test_cli_run_forever_reinvokes_without_more_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(tmp_path, task="/run forever")
+    calls: list[dict] = []
+
+    class Saver:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def setup(self):
+            return None
+
+        async def aget_tuple(self, _config):
+            return SimpleNamespace(
+                checkpoint={"channel_values": {"messages": [resume_message("resume"), task_message("original task")]}},
+                config={"configurable": {"checkpoint_id": "test"}},
+            )
+
+    class Graph:
+        async def ainvoke(self, update, config):
+            calls.append(update)
+            if len(calls) == 2:
+                raise asyncio.CancelledError
+            return {"messages": [AIMessage(content="done")]}
+
+        async def astream(self, update, config, **_kwargs):
+            result = await self.ainvoke(update, config)
+            yield {"type": "updates", "data": {"model": {"messages": result["messages"]}}}
+
+    class Browser:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    browser = Browser()
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr("boss_react.cli.configure_logging", lambda *_args: None)
+    monkeypatch.setattr("boss_react.cli.AsyncSqliteSaver.from_conn_string", lambda *_args: Saver())
+    monkeypatch.setattr("boss_react.cli.build_agent", lambda *_args, **_kwargs: (Graph(), browser))
+    monkeypatch.setattr("boss_react.cli.asyncio.sleep", no_delay)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run(argparse.Namespace(config=config_path, task=None))
+
+    assert len(calls) == 2
+    assert all(call["messages"][0].content.startswith("继续执行") for call in calls)
+    assert browser.closed is True
+
+
+async def test_cli_new_switch_and_list_chats_use_separate_sqlite_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    config_path = _write_config(tmp_path, task="/new chat abc")
+    inputs = iter([
+        "/chats", "first task", "/new chat xyz", "/chats",
+        "/new chat abc", "/switch chat missing", "second task",
+        "/switch chat abc", "third task", "/exit",
+    ])
+
+    class ToolCallingModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    class Session:
+        async def start(self):
+            return {"event": "ready"}
+
+        async def call(self, name, **kwargs):
+            return {"ok": True, "logged_in": True, "page_state": {"kind": "boss_home"}}
+
+        async def close(self):
+            return None
+
+    browser = NodriverBrowserMiddleware(session=Session())
+
+    def build_fake_agent(_settings, *, checkpointer):
+        graph = create_agent(
+            ToolCallingModel(responses=[AIMessage(content="done")]),
+            middleware=[AgentNodeCompactionMiddleware(trigger_tokens=1000), browser],
+            checkpointer=checkpointer,
+        )
+        return graph, browser
+
+    async def next_input():
+        return next(inputs)
+
+    monkeypatch.setattr("boss_react.cli.configure_logging", lambda *_args: None)
+    monkeypatch.setattr("boss_react.cli.build_agent", build_fake_agent)
+    monkeypatch.setattr("boss_react.cli._read_next_input", next_input)
+
+    assert await run(argparse.Namespace(config=config_path, task=None)) == 0
+    output = capsys.readouterr().out
+    assert "当前聊天: abc" in output
+    assert "当前聊天: xyz" in output
+    assert "* abc" in output
+    assert "* xyz" in output
+    assert "  abc" in output
+    assert "聊天 abc 已存在" in output
+    assert "聊天 missing 不存在" in output
+
+    settings = load_agent_settings(config_path)
+    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_database_path)) as saver:
+        await saver.setup()
+        abc = await saver.aget_tuple({"configurable": {"thread_id": "abc"}})
+        xyz = await saver.aget_tuple({"configurable": {"thread_id": "xyz"}})
+    abc_text = [m.content for m in abc.checkpoint["channel_values"]["messages"] if isinstance(m, HumanMessage)]
+    xyz_text = [m.content for m in xyz.checkpoint["channel_values"]["messages"] if isinstance(m, HumanMessage)]
+    assert "first task" in abc_text and "third task" in abc_text
+    assert "second task" not in abc_text
+    assert "second task" in xyz_text
+    assert "first task" not in xyz_text

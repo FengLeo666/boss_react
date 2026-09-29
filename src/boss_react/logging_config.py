@@ -11,7 +11,7 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def configure_logging(log_file: Path, level: str = "INFO") -> None:
-    """Log to both the terminal and a bounded UTF-8 file."""
+    """Keep detailed logs in a bounded UTF-8 file; the CLI owns terminal output."""
     resolved = Path(log_file).expanduser().resolve()
     resolved.parent.mkdir(parents=True, exist_ok=True)
     numeric_level = getattr(logging, level.upper(), logging.INFO)
@@ -24,11 +24,6 @@ def configure_logging(log_file: Path, level: str = "INFO") -> None:
             root.removeHandler(handler)
             handler.close()
 
-    console = logging.StreamHandler()
-    console.setLevel(numeric_level)
-    console.setFormatter(formatter)
-    console._boss_react_handler = True  # type: ignore[attr-defined]
-
     file_handler = RotatingFileHandler(
         resolved,
         maxBytes=10 * 1024 * 1024,
@@ -39,6 +34,5 @@ def configure_logging(log_file: Path, level: str = "INFO") -> None:
     file_handler.setFormatter(formatter)
     file_handler._boss_react_handler = True  # type: ignore[attr-defined]
 
-    root.addHandler(console)
     root.addHandler(file_handler)
     logging.getLogger(__name__).info("日志已初始化: level=%s file=%s", level.upper(), resolved)

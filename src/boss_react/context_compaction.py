@@ -9,6 +9,7 @@ from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
+    AgentState,
     ExtendedModelResponse,
     ModelRequest,
     ModelResponse,
@@ -18,6 +19,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveM
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,10 @@ _RESUME_ROLE = "resume"
 _TASK_ROLE = "task"
 _COMPACTION_REQUEST_ROLE = "compaction_request"
 _COMPACTED_CONTEXT_ROLE = "compacted_context"
+
+
+class CompactionAgentState(AgentState):
+    manual_compact: NotRequired[bool]
 
 COMPACTION_PROMPT = """你现在只执行上下文压缩，不执行求职任务。
 禁止调用任何工具，也不要提出新的操作计划。请把此前对话中继续完成任务所必需的信息压缩为一份简洁但无损的上下文，尤其保留：已查看和操作过的岗位、页面状态、已发送内容、失败原因、用户约束、尚未完成的步骤，以及避免重复操作所需的信息。
@@ -72,6 +78,8 @@ def _image_count(messages: list[AnyMessage]) -> int:
 class AgentNodeCompactionMiddleware(AgentMiddleware):
     """Compact state through the agent's own model node before normal execution."""
 
+    state_schema = CompactionAgentState
+
     def __init__(self, trigger_tokens: int, trigger_images: int = 255) -> None:
         if trigger_tokens <= 0:
             raise ValueError("trigger_tokens must be positive")
@@ -91,16 +99,18 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
         already_requested = any(
             _has_role(message, _COMPACTION_REQUEST_ROLE) for message in messages
         )
+        manual = bool(state.get("manual_compact", False))
         should_compact = (
-            total_tokens >= self.trigger_tokens or total_images >= self.trigger_images
+            manual or total_tokens >= self.trigger_tokens or total_images >= self.trigger_images
         ) and not already_requested
         logger.info(
-            "上下文检查(before_agent): messages=%d approx_tokens=%d token_trigger=%d images=%d image_trigger=%d compact=%s",
+            "上下文检查(before_agent): messages=%d approx_tokens=%d token_trigger=%d images=%d image_trigger=%d manual=%s compact=%s",
             len(messages),
             total_tokens,
             self.trigger_tokens,
             total_images,
             self.trigger_images,
+            manual,
             should_compact,
         )
         if not should_compact:
@@ -144,7 +154,7 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
             raise RuntimeError(f"压缩阶段禁止工具调用，模型却返回了: {names}")
         return response
 
-    @hook_config(can_jump_to=["model"])
+    @hook_config(can_jump_to=["model", "end"])
     def after_model(
         self, state: dict[str, Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
@@ -208,6 +218,7 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
             len(response.text.strip()),
         )
         self._started_at = None
+        manual = bool(state.get("manual_compact", False))
         return {
             "messages": [
                 RemoveMessage(id=REMOVE_ALL_MESSAGES),
@@ -215,5 +226,6 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
                 task,
                 compacted,
             ],
-            "jump_to": "model",
+            "manual_compact": False,
+            "jump_to": "end" if manual else "model",
         }

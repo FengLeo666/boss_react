@@ -225,6 +225,17 @@ async def test_lifecycle_starts_and_closes_the_retained_session(
     assert session.closed is True
 
 
+async def test_manual_compaction_does_not_start_browser(
+    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+) -> None:
+    middleware, session = fake_middleware
+
+    await middleware.abefore_agent({"manual_compact": True, "messages": []}, None)
+
+    assert session.calls == []
+    assert session.started is False
+
+
 @pytest.mark.asyncio
 async def test_every_tool_result_gets_one_post_action_screenshot(
     fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],

@@ -31,6 +31,9 @@ Before asking for a task, the CLI loads the configured checkpoint and prints
 its readable conversation history. Resume contents are represented by a short
 placeholder. Tool calls, screenshots, and tool results are omitted entirely.
 When the checkpoint has no messages, no history section is printed.
+During a run, press Esc to request a LangGraph pause at the next step boundary
+and return to the CLI prompt. The current model or browser tool call finishes
+first. Esc also exits `/run forever`; completed steps remain in the checkpoint.
 
 LangGraph state is persisted by `AsyncSqliteSaver`. The database path and stable
 `thread_id` are configured in `[checkpoint]`. On the first run, the state starts
@@ -77,11 +80,10 @@ the detected page kind for context, while invalid actions fail with a tool error
 the agent can inspect and recover from.
 
 Tabs are intentionally invisible to the agent. A click that opens a new page
-automatically makes it active. `browser_back` first uses that page's history,
-then closes it and returns to the previous hidden page; with nowhere left to go,
-it opens the BOSS homepage. `browser_reset` closes every page and creates one
-clean homepage while preserving the profile and login cookies. The backend keeps
-at most ten page tabs and evicts the oldest background page when necessary.
+automatically makes it active and closes older pages. `browser_back` uses the
+active page's history and returns a tool error when there is no previous page.
+`browser_reset` opens a new homepage and closes previous tabs while preserving
+the profile and login cookies.
 
 ## LangChain setup
 

@@ -19,6 +19,7 @@ from langgraph.types import Command
 from typing_extensions import NotRequired
 
 from .nodriver import NodriverBrowserConfig, NodriverBrowserSession, NodriverToolError
+from .console_output import tool_finished, tool_started
 
 MatchMode = Literal["exact", "contains", "regex"]
 logger = logging.getLogger(__name__)
@@ -110,7 +111,10 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         self.tools = self._build_tools()
 
     async def abefore_agent(self, state: Any, runtime: Any) -> None:
-        del state, runtime
+        del runtime
+        if isinstance(state, dict) and state.get("manual_compact", False):
+            logger.info("手动压缩模式跳过浏览器启动")
+            return
         logger.info("正在启动 nodriver 浏览器会话")
         await self.session.start()
         login = await self.session.call("browser_ensure_login")
@@ -131,6 +135,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         tools = getattr(request, "tools", []) or []
         started = time.perf_counter()
         logger.info("开始模型调用: messages=%d tools=%d", len(messages), len(tools))
+        print("[模型] 思考中...", flush=True)
         try:
             response = await handler(request)
         except Exception:
@@ -153,6 +158,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         arguments = tool_call.get("args", {})
         started = time.perf_counter()
         logger.info("开始工具调用: tool=%s args=%s", name, _argument_summary(arguments))
+        tool_started(name, arguments if isinstance(arguments, dict) else {})
         cache_entry: dict[str, str] | None = None
         try:
             if name == "browser_eval_js":
@@ -192,6 +198,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         except Exception:
             logger.exception("工具调用异常: tool=%s elapsed=%.2fs", name, time.perf_counter() - started)
             raise
+        shot: dict[str, Any] | None = None
         try:
             shot = _hide_url_information(await self.session.call("browser_settle_and_screenshot"))
             path = Path(shot["path"])
@@ -207,6 +214,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
             result.content = blocks
         except Exception as exc:
             logger.exception("工具后截图失败: tool=%s", name)
+            shot = None
             warning = f"Post-tool screenshot unavailable: {type(exc).__name__}: {exc}"
             if isinstance(result.content, str):
                 result.content += "\n" + warning
@@ -220,6 +228,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         )
         if getattr(result, "status", None) == "error":
             logger.warning("工具返回错误状态: tool=%s detail=%s", name, str(result.content)[:1000])
+        tool_finished(name, result, shot, time.perf_counter() - started)
         if cache_entry and result.status != "error":
             logger.info("JavaScript 已写入 checkpoint 状态: name=%s chars=%d", cache_name, len(script))
             return Command(update={"js_cache": cache_entry, "messages": [result]})
@@ -350,12 +359,12 @@ class NodriverBrowserMiddleware(AgentMiddleware):
 
         @tool("browser_back")
         async def browser_back() -> dict[str, Any]:
-            """Go back in-page; otherwise return to the previous hidden page, then fall back to BOSS home."""
+            """Go back in the active page's history; report an error if no previous page exists."""
             return await model_safe_call("browser_back")
 
         @tool("browser_reset")
         async def browser_reset() -> dict[str, Any]:
-            """Close every hidden browser page, clear navigation state, and open a clean BOSS homepage."""
+            """Open a new BOSS homepage and close prior tabs."""
             return await model_safe_call("browser_reset")
 
         @tool("browser_wait")
