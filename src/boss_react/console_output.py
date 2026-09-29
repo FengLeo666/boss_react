@@ -7,9 +7,13 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 
 _TOOL_LABELS = {
     "browser_state": "查看页面",
@@ -40,6 +44,11 @@ _PAGE_LABELS = {
 }
 
 _model_line_open = False
+_model_live: Live | None = None
+_model_console: Console | None = None
+_model_buffer = ""
+_last_model_refresh = 0.0
+_MARKDOWN_REFRESH_SECONDS = 0.1
 
 _LOGO = (
     r" ____   ___  ____ ____      ____  _____    _    ____ _____",
@@ -70,20 +79,58 @@ def show_banner(thread_id: str, log_file: Path) -> None:
 
 
 def stream_model_text(delta: str) -> None:
-    global _model_line_open
+    global _model_line_open, _model_live, _model_console, _model_buffer, _last_model_refresh
     if not delta:
         return
     if not _model_line_open:
-        print("[模型] ", end="", flush=True)
         _model_line_open = True
-    print(delta, end="", flush=True)
+        if sys.stdout.isatty():
+            _model_console = Console(file=sys.stdout)
+            print("[模型]", flush=True)
+            _model_live = Live(
+                Markdown(delta),
+                console=_model_console,
+                auto_refresh=False,
+                redirect_stdout=False,
+                redirect_stderr=False,
+                vertical_overflow="ellipsis",
+            )
+            _model_buffer = delta
+            _last_model_refresh = time.monotonic()
+            _model_live.start(refresh=True)
+            return
+        print("[模型] ", end="", flush=True)
+    if _model_live is None:
+        print(delta, end="", flush=True)
+        return
+    _model_buffer += delta
+    now = time.monotonic()
+    if now - _last_model_refresh >= _MARKDOWN_REFRESH_SECONDS:
+        _model_live.update(Markdown(_model_buffer), refresh=True)
+        _last_model_refresh = now
 
 
 def finish_model_text() -> None:
-    global _model_line_open
+    global _model_line_open, _model_live, _model_console, _model_buffer, _last_model_refresh
     if _model_line_open:
-        print(flush=True)
+        if _model_live is not None:
+            live = _model_live
+            live.update(Markdown(_model_buffer), refresh=True)
+            live.stop()
+        else:
+            print(flush=True)
         _model_line_open = False
+        _model_live = None
+        _model_console = None
+        _model_buffer = ""
+        _last_model_refresh = 0.0
+
+
+def print_markdown(text: str) -> None:
+    if sys.stdout.isatty():
+        Console(file=sys.stdout).print(Markdown(text))
+    else:
+        print(text, flush=True)
 
 
 def _short(value: Any, limit: int = 150) -> str:

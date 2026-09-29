@@ -1,14 +1,41 @@
 from __future__ import annotations
 
+import io
 import logging
+import sys
 from pathlib import Path
 
+import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langgraph.runtime import RunControl
 
 from boss_react.cli import _stream_agent
 from boss_react.console_output import finish_model_text, stream_model_text, tool_finished, tool_started
 from boss_react.logging_config import configure_logging
+
+
+class TerminalBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_interactive_model_output_renders_markdown_and_finishes_before_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = TerminalBuffer()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    stream_model_text("## 结论\n\n**推")
+    stream_model_text("荐**这个岗位")
+    tool_started("browser_click_text", {"text": "职位"})
+
+    rendered = output.getvalue()
+    assert "[模型]" in rendered
+    assert "结论" in rendered
+    assert "推荐" in rendered
+    assert "**推荐**" not in rendered
+    assert "[工具] 点击  '职位'" in rendered
+    assert rendered.index("推荐") < rendered.index("[工具] 点击")
 
 
 def test_console_shows_tool_actions_and_bounded_results_without_payloads(capsys) -> None:

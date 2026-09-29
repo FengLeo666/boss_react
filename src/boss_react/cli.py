@@ -21,7 +21,7 @@ from prompt_toolkit import PromptSession
 from .agent import build_agent, build_initial_messages
 from .agent_config import AgentSettings, load_agent_settings
 from .context_compaction import task_message
-from .console_output import finish_model_text, show_banner, stream_model_text
+from .console_output import finish_model_text, print_markdown, show_banner, stream_model_text
 from .logging_config import configure_logging
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "agent.toml"
@@ -246,7 +246,8 @@ def display_checkpoint_history(checkpoint: Any | None) -> None:
     for label, text in visible:
         if len(text) > _MAX_HISTORY_TEXT_CHARS:
             text = text[:_MAX_HISTORY_TEXT_CHARS] + "\n[内容过长，已截断]"
-        print(f"\n[{label}]\n{text}")
+        print(f"\n[{label}]", flush=True)
+        print_markdown(text)
     print("=== 历史结束 ===\n", flush=True)
 
 
@@ -273,20 +274,47 @@ async def _list_chat_ids(checkpointer: AsyncSqliteSaver) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+async def _load_active_chat(checkpointer: AsyncSqliteSaver, default_thread_id: str) -> str:
+    await checkpointer.conn.execute(
+        "CREATE TABLE IF NOT EXISTS boss_react_cli_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    await checkpointer.conn.commit()
+    async with checkpointer.conn.execute(
+        "SELECT value FROM boss_react_cli_state WHERE key = ?", ("active_thread_id",)
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return default_thread_id
+    selected = str(row[0])
+    if selected in await _list_chat_ids(checkpointer):
+        return selected
+    logger.warning("已保存的聊天不存在，回退到默认会话: thread_id=%s", selected)
+    return default_thread_id
+
+
+async def _save_active_chat(checkpointer: AsyncSqliteSaver, thread_id: str) -> None:
+    await checkpointer.conn.execute(
+        "INSERT INTO boss_react_cli_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("active_thread_id", thread_id),
+    )
+    await checkpointer.conn.commit()
+
+
 async def run(args: argparse.Namespace) -> int:
     settings = load_agent_settings(args.config)
     configure_logging(settings.log_file, settings.log_level)
     settings.checkpoint_database_path.parent.mkdir(parents=True, exist_ok=True)
-    current_thread_id = settings.checkpoint_thread_id
-    show_banner(current_thread_id, settings.log_file)
-    run_config = {
-        "recursion_limit": settings.recursion_limit,
-        "configurable": {"thread_id": current_thread_id},
-    }
     async with AsyncSqliteSaver.from_conn_string(
         str(settings.checkpoint_database_path)
     ) as checkpointer:
         await checkpointer.setup()
+        current_thread_id = await _load_active_chat(checkpointer, settings.checkpoint_thread_id)
+        show_banner(current_thread_id, settings.log_file)
+        run_config = {
+            "recursion_limit": settings.recursion_limit,
+            "configurable": {"thread_id": current_thread_id},
+        }
         checkpoint = await checkpointer.aget_tuple(run_config)
         display_checkpoint_history(checkpoint)
         task = await resolve_task(settings, args.task)
@@ -343,6 +371,7 @@ async def run(args: argparse.Namespace) -> int:
                         }
                         if action == "new":
                             await graph.aupdate_state(next_config, {"messages": []})
+                        await _save_active_chat(checkpointer, chat_id)
                         current_thread_id = chat_id
                         run_config = next_config
                         checkpoint = await checkpointer.aget_tuple(run_config)

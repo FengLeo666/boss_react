@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from langchain.agents import create_agent
@@ -219,6 +222,30 @@ def test_checkpoint_history_is_displayed_without_tool_payloads(capsys: pytest.Ca
     assert "large screenshot payload" not in output
     assert "browser_state" not in output
     assert "工具" not in output
+
+
+def test_checkpoint_history_renders_markdown_in_interactive_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TerminalBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    output = TerminalBuffer()
+    monkeypatch.setattr(sys, "stdout", output)
+    checkpoint = SimpleNamespace(checkpoint={"channel_values": {"messages": [
+        HumanMessage(content="## 目标\n\n**校招**岗位"),
+        AIMessage(content="找到 `Agent` 职位"),
+        ToolMessage(content="screenshot payload", tool_call_id="tool-1"),
+    ]}})
+
+    display_checkpoint_history(checkpoint)
+
+    rendered = output.getvalue()
+    assert "[用户]" in rendered and "[助手]" in rendered
+    assert "目标" in rendered and "校招" in rendered
+    assert "**校招**" not in rendered
+    assert "screenshot payload" not in rendered
 
 
 def test_empty_checkpoint_history_prints_nothing(capsys: pytest.CaptureFixture) -> None:
@@ -487,6 +514,9 @@ async def test_cli_loops_after_agent_end_and_manual_compaction_waits_for_input(
         return next(inputs)
 
     monkeypatch.setattr("boss_react.cli.configure_logging", lambda *_args: None)
+    monkeypatch.setattr(
+        cli_module, "_load_active_chat", AsyncMock(side_effect=lambda _saver, default: default)
+    )
     monkeypatch.setattr("boss_react.cli.AsyncSqliteSaver.from_conn_string", lambda *_args: saver)
     monkeypatch.setattr("boss_react.cli.build_agent", lambda *_args, **_kwargs: (Graph(), browser))
     monkeypatch.setattr("boss_react.cli._read_next_input", next_input)
@@ -653,6 +683,9 @@ async def test_cli_escape_returns_to_input_and_stops_forever_mode(
         return next(inputs)
 
     monkeypatch.setattr(cli_module, "configure_logging", lambda *_args: None)
+    monkeypatch.setattr(
+        cli_module, "_load_active_chat", AsyncMock(side_effect=lambda _saver, default: default)
+    )
     monkeypatch.setattr(cli_module.AsyncSqliteSaver, "from_conn_string", lambda *_args: saver)
     monkeypatch.setattr(cli_module, "build_agent", lambda *_args, **_kwargs: (Graph(), Browser()))
     monkeypatch.setattr(cli_module, "_watch_escape", watch_escape)
@@ -710,6 +743,9 @@ async def test_cli_run_forever_reinvokes_without_more_input(
         return None
 
     monkeypatch.setattr("boss_react.cli.configure_logging", lambda *_args: None)
+    monkeypatch.setattr(
+        cli_module, "_load_active_chat", AsyncMock(side_effect=lambda _saver, default: default)
+    )
     monkeypatch.setattr("boss_react.cli.AsyncSqliteSaver.from_conn_string", lambda *_args: Saver())
     monkeypatch.setattr("boss_react.cli.build_agent", lambda *_args, **_kwargs: (Graph(), browser))
     monkeypatch.setattr("boss_react.cli.asyncio.sleep", no_delay)
@@ -729,7 +765,7 @@ async def test_cli_new_switch_and_list_chats_use_separate_sqlite_threads(
     inputs = iter([
         "/chats", "first task", "/new chat xyz", "/chats",
         "/new chat abc", "/switch chat missing", "second task",
-        "/switch chat abc", "third task", "/exit",
+        "/switch chat abc", "third task", "/switch chat xyz", "/exit",
     ])
 
     class ToolCallingModel(FakeMessagesListChatModel):
@@ -784,3 +820,17 @@ async def test_cli_new_switch_and_list_chats_use_separate_sqlite_threads(
     assert "second task" not in abc_text
     assert "second task" in xyz_text
     assert "first task" not in xyz_text
+
+    assert await run(argparse.Namespace(config=config_path, task="/exit")) == 0
+    assert "会话  xyz" in capsys.readouterr().out
+
+    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_database_path)) as saver:
+        await saver.setup()
+        await saver.conn.execute(
+            "UPDATE boss_react_cli_state SET value = ? WHERE key = ?",
+            ("deleted-chat", "active_thread_id"),
+        )
+        await saver.conn.commit()
+
+    assert await run(argparse.Namespace(config=config_path, task="/exit")) == 0
+    assert "会话  test-thread" in capsys.readouterr().out

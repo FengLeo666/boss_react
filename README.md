@@ -1,8 +1,33 @@
-# BOSS React
+<div align="center">
 
-> BOSS 的页面在变，自动化限制也在更新。我们目前绕过了所有阻碍，构建了这个全自动化agent。您可以关注项目，我们会针对boss最新的护栏更新。
+<h1>BOSS React</h1>
 
-**像使用 Coding Agent 一样找工作。** 在终端说出目标，Agent 会观察页面、打开职位、阅读要求、判断匹配，再决定是否沟通。工具调用和结果实时可见；按 `Esc` 暂停，补充要求后从检查点继续。
+<p><strong>像使用 Coding Agent 一样，交互式寻找并沟通工作机会。</strong></p>
+
+<p>
+  <img alt="Python 3.12-3.13" src="https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white">
+  <img alt="LangChain Agent" src="https://img.shields.io/badge/LangChain-Agent-1C3C3C">
+  <img alt="nodriver browser" src="https://img.shields.io/badge/Browser-nodriver-2A9D8F">
+  <img alt="SQLite checkpoint" src="https://img.shields.io/badge/Checkpoint-SQLite-5B6DCD">
+</p>
+
+<p>BOSS 的页面在变，自动化限制也在更新。我们目前绕过了所有阻碍，构建了这个全自动化agent。您可以关注项目，我们会针对boss最新的护栏更新。</p>
+
+<p>
+  <a href="#2-怎么使用">交互命令</a> ·
+  <a href="#3-快速开始">快速开始</a> ·
+  <a href="#4-它如何工作">工作原理</a> ·
+  <a href="#6-技术亮点">技术亮点</a>
+</p>
+
+</div>
+
+<p align="center">
+  <a href="assests/images/运行演示.gif"><img src="assests/images/运行演示.gif" alt="BOSS React 从交互输入到岗位沟通结果的运行演示" width="48%"></a>
+  <a href="assests/images/运行截图.png"><img src="assests/images/运行截图.png" alt="BOSS React 的运行截图" width="48%"></a>
+</p>
+
+在终端说出目标，Agent 会观察页面、打开职位、阅读要求、判断匹配，再决定是否沟通。工具调用和结果实时可见；按 `Esc` 暂停，补充要求后从检查点继续。
 
 ## 1. 像 Coding Agent 一样交互
 
@@ -11,8 +36,6 @@
 ![BOSS React 欢迎界面与会话命令](assests/images/欢迎界面.png)
 
 运行时，模型的判断、工具调用、页面状态和发送结果会逐步显示。工作中按 `Esc`，当前步骤结束后就回到输入框。
-
-![Agent 观察岗位、调用浏览器工具并暂停的运行截图](assests/images/运行截图.png)
 
 它不是固定脚本：下一步点哪里、岗位是否合适，由模型结合你的要求、简历事实和当前页面决定。**发送消息是真实操作**，请在任务中写清筛选条件和沟通边界。
 
@@ -33,8 +56,8 @@
 | `/run forever` | 在已有任务会话中持续运行；按 `Esc` 停止 |
 | `/compact` | 手动压缩当前会话上下文，完成后等待再次输入 |
 | `/chats` | 列出保存过的会话 ID |
-| `/new chat <名称>` | 创建并切换到新会话 |
-| `/switch chat <名称>` | 切换到已有会话 |
+| `/new chat <名称>` | 创建并切换到新会话，下次启动仍默认选中 |
+| `/switch chat <名称>` | 切换到已有会话，并记住下次启动的默认会话 |
 | `/exit` | 退出程序 |
 
 粘贴多行任务后按回车提交；不支持增强粘贴的终端会退回“输入空行提交”。也可以通过 `--task` 提交启动任务。`/run forever` 需要先有一个任务会话。
@@ -91,7 +114,7 @@ Agent 不需要管理标签页：新页面出现后工具层接管它并关闭�
 | `[agent].resume_image_path` | 简历图片路径；空字符串或文件不存在时关闭图片工具 |
 | `[model].request_timeout_seconds` | 模型请求超时 |
 | `[context].summary_trigger_tokens` / `summary_trigger_images` | 自动压缩阈值 |
-| `[checkpoint].database_path` / `thread_id` | SQLite 检查点与默认会话 |
+| `[checkpoint].database_path` / `thread_id` | SQLite 检查点；`thread_id` 是未曾切换时的默认会话 |
 | `[runtime].log_file` | 详细运行日志 |
 
 系统提示词在 `config/system_prompt.txt`。`.env`、简历、浏览器资料、日志和检查点保留在本地，已列入 `.gitignore`。**不要把密钥、简历或登录资料提交到仓库。**
@@ -102,7 +125,7 @@ Agent 不需要管理标签页：新页面出现后工具层接管它并关闭�
 - **每一步都有可见反馈**：工具执行后等待页面网络趋于空闲，再捕获截图连同页面状态返回模型；终端流式输出模型文本和精简的工具结果，详细参数与异常写入滚动日志。实现：[网络等待与截图](scripts/nodriver_tool_driver.py#L763) · [工具结果附图](src/boss_react/nodriver_middleware.py#L201) · [终端输出](src/boss_react/console_output.py)
 - **SSE 模型流式输出**：兼容模型网关支持流式响应时，LangGraph 的 `astream` 接收模型消息增量，CLI 边收到边打印，并用最终消息更新兜底，避免重复输出。这里消费的是模型接口的 SSE 流，不是项目另起一个 SSE 服务端。实现：[流式消费与去重](src/boss_react/cli.py#L112)
 - **动态标签页接管**：点击后即使新页面延迟出现，截图流程也会尝试发现并切换到新 target；激活新页后关闭旧页，不向 Agent 暴露或维护标签页栈。截图或驱动超时会记录请求现场并强制重启浏览器。实现：[切换与关闭旧页](scripts/nodriver_tool_driver.py#L175) · [截图兜底](scripts/nodriver_tool_driver.py#L720) · [超时重启](src/boss_react/nodriver.py#L227)
-- **可中断、可续跑**：`Esc` 通过 LangGraph 的 `RunControl` 请求在步骤边界暂停；SQLite checkpoint 保存消息与状态，重启进程或切换 `thread_id` 后可以继续。实现：[Esc 监听](src/boss_react/cli.py#L150) · [SQLite 检查点](src/boss_react/cli.py#L286)
+- **可中断、可续跑**：`Esc` 通过 LangGraph 的 `RunControl` 请求在步骤边界暂停；SQLite checkpoint 保存消息与状态，也记住最近选中的 chat，重启进程后可以直接继续。实现：[Esc 监听](src/boss_react/cli.py#L150) · [当前 chat 持久化](src/boss_react/cli.py#L276) · [SQLite 检查点](src/boss_react/cli.py#L307)
 - **为 cache read 设计的自定义压缩**：按 token 数或截图数量自动触发，也支持 `/compact`。Middleware 只在原有消息末尾追加一条压缩指令，不先搬运或改写历史，仍通过 Agent 的模型节点调用模型；不变的消息前缀因此有机会命中服务商的 prompt cache read。压缩阶段禁用工具调用，拿到摘要后才把 checkpoint 收敛为简历、当前任务和压缩结果。实际缓存命中取决于模型服务商。实现：[触发与追加指令](src/boss_react/context_compaction.py#L92) · [禁用工具](src/boss_react/context_compaction.py#L133) · [重写状态](src/boss_react/context_compaction.py#L158)
 - **可复用的页面脚本**：JavaScript 工具可用名称缓存脚本，之后只传名称即可重跑；同名传入新代码会更新缓存，缓存随 checkpoint 持久化。工具返回给模型前会移除 URL 信息。实现：[脚本缓存](src/boss_react/nodriver_middleware.py#L160) · [URL 过滤](src/boss_react/nodriver_middleware.py#L37)
 - **与 BOSS 页面限制正面交手**：曾遇到 Playwright 通过 CDP 接入后页面反复刷新，正式流程改用 nodriver 独立启动浏览器；职位页延迟打开导致旧 target 失效，就在截图时重新发现新页、激活并关闭旧页；截图命令卡住则超时重启并把现场写入日志。登录拦截不做绕过，仍由用户扫码完成。实现：[浏览器启动](src/boss_react/nodriver_backend.py#L54) · [新页接管](scripts/nodriver_tool_driver.py#L206) · [超时重启](src/boss_react/nodriver.py#L227) · [登录检查](src/boss_react/nodriver_middleware.py#L113)
