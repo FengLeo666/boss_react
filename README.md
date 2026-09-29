@@ -24,7 +24,7 @@
 
 <p align="center">
   <a href="assests/images/运行演示.gif"><img src="assests/images/运行演示.gif" alt="BOSS React 从交互输入到岗位沟通结果的运行演示" width="48%"></a>
-  <a href="assests/images/运行截图.png"><img src="assests/images/运行截图.png" alt="BOSS React 的运行截图" width="48%"></a>
+  <a href="assests/images/运行截图.png"><img src="assests/images/运行截图.png?v=724d032" alt="BOSS React 的运行截图" width="48%"></a>
 </p>
 
 在终端说出目标，Agent 会观察页面、打开职位、阅读要求、判断匹配，再决定是否沟通。工具调用和结果实时可见；按 `Esc` 暂停，补充要求后从检查点继续。
