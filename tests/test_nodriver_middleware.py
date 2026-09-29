@@ -5,10 +5,16 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain.agents import create_agent
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from boss_react import NodriverBrowserConfig, NodriverBrowserMiddleware
 from boss_react.nodriver import NodriverToolError
 from langchain_core.messages import ToolMessage
+from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
 from boss_react.nodriver_middleware import _normalize_patterns
 
 
@@ -110,7 +116,7 @@ async def test_text_click_and_javascript_are_forwarded_without_filtering(
     await tools["browser_click_text"].ainvoke({
         "text": "立即沟通", "match": "contains", "scope_text": "百度", "occurrence": 2,
     })
-    await tools["browser_eval_js"].ainvoke({"script": script})
+    await tools["browser_eval_js"].ainvoke({"name": "clear_page", "script": script})
 
     assert session.calls[0] == (
         "browser_click_text",
@@ -258,3 +264,112 @@ async def test_failed_tool_also_returns_post_action_screenshot(
     assert session.calls == [("browser_settle_and_screenshot", {})]
     assert result.content[-1]["type"] == "image"
     assert "No element matched" in result.content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_named_javascript_is_checkpointed_and_reused_after_middleware_restart(
+    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+) -> None:
+    middleware, session = fake_middleware
+    seen: list[dict[str, Any]] = []
+
+    async def handler(request):
+        seen.append(request.tool_call["args"])
+        return ToolMessage(content='{"ok": true}', tool_call_id=request.tool_call["id"])
+
+    request = ToolCallRequest(
+        tool_call={"name": "browser_eval_js", "args": {"name": "find_jobs", "script": "return 42"}, "id": "first"},
+        tool=None, state={"messages": []}, runtime=None,
+    )
+    saved = await middleware.awrap_tool_call(request, handler)
+    assert isinstance(saved, Command)
+    assert saved.update["js_cache"] == {"find_jobs": "return 42"}
+    assert saved.update["messages"][0].content[-1]["type"] == "image"
+
+    resumed = NodriverBrowserMiddleware(session=session)
+    replay = ToolCallRequest(
+        tool_call={"name": "browser_eval_js", "args": {"name": "find_jobs"}, "id": "second"},
+        tool=None, state={"messages": [], "js_cache": saved.update["js_cache"]}, runtime=None,
+    )
+    result = await resumed.awrap_tool_call(replay, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert seen == [
+        {"name": "find_jobs", "script": "return 42"},
+        {"name": "find_jobs", "script": "return 42"},
+    ]
+    assert session.calls == [
+        ("browser_settle_and_screenshot", {}),
+        ("browser_settle_and_screenshot", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_javascript_name_fails_without_running_script(
+    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+) -> None:
+    middleware, session = fake_middleware
+    request = ToolCallRequest(
+        tool_call={"name": "browser_eval_js", "args": {"name": "missing"}, "id": "lookup"},
+        tool=None, state={"messages": [], "js_cache": {}}, runtime=None,
+    )
+
+    async def handler(_request):
+        pytest.fail("browser_eval_js should not run without cached code")
+
+    result = await middleware.awrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "No cached JavaScript" in result.content[0]["text"]
+    assert session.calls == [("browser_settle_and_screenshot", {})]
+
+
+async def test_javascript_cache_survives_sqlite_checkpoint_restart(tmp_path: Path) -> None:
+    class ToolCallingModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    screenshot = tmp_path / "shot.png"
+    screenshot.write_bytes(b"png-bytes")
+    session = FakeNodriverSession(screenshot)
+    config = {"configurable": {"thread_id": "js-cache-test"}}
+    database = tmp_path / "checkpoints.sqlite"
+
+    async with AsyncSqliteSaver.from_conn_string(str(database)) as saver:
+        await saver.setup()
+        first_model = ToolCallingModel(responses=[
+            AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs", "script": "return 42"}, "id": "js-1"}]),
+            AIMessage(content="saved"),
+        ])
+        first_agent = create_agent(first_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        first = await first_agent.ainvoke({"messages": [HumanMessage(content="run named JS")]}, config=config)
+        assert first["js_cache"] == {"count_jobs": "return 42"}
+
+        second_model = ToolCallingModel(responses=[
+            AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs"}, "id": "js-2"}]),
+            AIMessage(content="reused"),
+        ])
+        second_agent = create_agent(second_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        second = await second_agent.ainvoke({"messages": [HumanMessage(content="reuse named JS")]}, config=config)
+        assert second["js_cache"] == {"count_jobs": "return 42"}
+
+        update_model = ToolCallingModel(responses=[
+            AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs", "script": "return 99"}, "id": "js-3"}]),
+            AIMessage(content="updated"),
+        ])
+        update_agent = create_agent(update_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        updated = await update_agent.ainvoke({"messages": [HumanMessage(content="replace named JS")]}, config=config)
+        assert updated["js_cache"] == {"count_jobs": "return 99"}
+
+        replay_model = ToolCallingModel(responses=[
+            AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs"}, "id": "js-4"}]),
+            AIMessage(content="replayed update"),
+        ])
+        replay_agent = create_agent(replay_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        final = await replay_agent.ainvoke({"messages": [HumanMessage(content="reuse updated JS")]}, config=config)
+
+    assert final["js_cache"] == {"count_jobs": "return 99"}
+    assert [args["script"] for name, args in session.calls if name == "browser_eval_js"] == [
+        "return 42", "return 42", "return 99", "return 99",
+    ]

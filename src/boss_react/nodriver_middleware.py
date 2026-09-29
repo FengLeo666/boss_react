@@ -10,17 +10,27 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.tools import ToolException, tool
 from langchain_core.messages import ToolMessage
+from langgraph.types import Command
+from typing_extensions import NotRequired
 
 from .nodriver import NodriverBrowserConfig, NodriverBrowserSession, NodriverToolError
 
 MatchMode = Literal["exact", "contains", "regex"]
 logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _merge_js_cache(current: dict[str, str] | None, update: dict[str, str] | None) -> dict[str, str]:
+    return {**(current or {}), **(update or {})}
+
+
+class BrowserAgentState(AgentState):
+    js_cache: NotRequired[Annotated[dict[str, str], _merge_js_cache]]
 
 
 def _hide_url_information(value: Any) -> Any:
@@ -78,6 +88,7 @@ class NodriverBrowserMiddleware(AgentMiddleware):
     """Expose an unrestricted, persistent nodriver session as LangChain tools."""
 
     name = "nodriver_browser"
+    state_schema = BrowserAgentState
 
     def __init__(
         self,
@@ -130,19 +141,39 @@ class NodriverBrowserMiddleware(AgentMiddleware):
 
     async def awrap_tool_call(
         self, request: Any, handler: Callable[[Any], Awaitable[ToolMessage]]
-    ) -> ToolMessage:
+    ) -> ToolMessage | Command[Any]:
         async with self._tool_lock:
             return await self._execute_tool_call(request, handler)
 
     async def _execute_tool_call(
         self, request: Any, handler: Callable[[Any], Awaitable[ToolMessage]]
-    ) -> ToolMessage:
+    ) -> ToolMessage | Command[Any]:
         tool_call = request.tool_call
         name = tool_call.get("name", "unknown")
         arguments = tool_call.get("args", {})
         started = time.perf_counter()
         logger.info("开始工具调用: tool=%s args=%s", name, _argument_summary(arguments))
+        cache_entry: dict[str, str] | None = None
         try:
+            if name == "browser_eval_js":
+                cache_name = arguments.get("name")
+                script = arguments.get("script")
+                if not isinstance(cache_name, str) or not cache_name.strip():
+                    raise ValueError("browser_eval_js requires a non-empty name")
+                cache_name = cache_name.strip()
+                if script is None:
+                    state = getattr(request, "state", {}) or {}
+                    cached = state.get("js_cache", {}) if isinstance(state, dict) else {}
+                    script = cached.get(cache_name)
+                    if script is None:
+                        raise ValueError(f"No cached JavaScript named {cache_name!r}")
+                elif not isinstance(script, str) or not script.strip():
+                    raise ValueError("browser_eval_js script must be non-empty when provided")
+                else:
+                    cache_entry = {cache_name: script}
+                request = request.override(
+                    tool_call={**tool_call, "args": {"name": cache_name, "script": script}}
+                )
             result = await handler(request)
         except (NodriverToolError, TimeoutError, ValueError, FileNotFoundError, ToolException) as exc:
             logger.warning(
@@ -189,6 +220,9 @@ class NodriverBrowserMiddleware(AgentMiddleware):
         )
         if getattr(result, "status", None) == "error":
             logger.warning("工具返回错误状态: tool=%s detail=%s", name, str(result.content)[:1000])
+        if cache_entry and result.status != "error":
+            logger.info("JavaScript 已写入 checkpoint 状态: name=%s chars=%d", cache_name, len(script))
+            return Command(update={"js_cache": cache_entry, "messages": [result]})
         return result
 
     async def aclose(self) -> None:
@@ -330,8 +364,10 @@ class NodriverBrowserMiddleware(AgentMiddleware):
             return await model_safe_call("browser_wait", milliseconds=milliseconds)
 
         @tool("browser_eval_js")
-        async def browser_eval_js(script: str) -> dict[str, Any]:
-            """Run unrestricted JavaScript in the active page. Use return to provide a JSON-serializable result."""
+        async def browser_eval_js(name: str, script: str | None = None) -> dict[str, Any]:
+            """Run JavaScript in the active page. Give a reusable name and script to cache it in the checkpoint; later pass only name to rerun it. Use return for JSON-serializable results."""
+            if script is None:
+                raise ValueError("Cached JavaScript must be resolved by the agent middleware")
             return await model_safe_call("browser_eval_js", script=script)
 
         @tool("browser_upload_text")
