@@ -85,10 +85,10 @@ def _argument_summary(arguments: Any, limit: int = 600) -> str:
     return rendered if len(rendered) <= limit else rendered[:limit] + "..."
 
 
-class NodriverBrowserMiddleware(AgentMiddleware):
+class BossReactMiddleware(AgentMiddleware):
     """Expose an unrestricted, persistent nodriver session as LangChain tools."""
 
-    name = "nodriver_browser"
+    name = "boss_react_browser"
     state_schema = BrowserAgentState
 
     def __init__(
@@ -100,13 +100,8 @@ class NodriverBrowserMiddleware(AgentMiddleware):
     ) -> None:
         super().__init__()
         self.session = session or NodriverBrowserSession(config)
-        self.resume_image_path = (
-            Path(resume_image_path).expanduser().resolve()
-            if resume_image_path is not None
-            else None
-        )
-        if self.resume_image_path is not None and not self.resume_image_path.is_file():
-            raise FileNotFoundError(f"Configured resume image not found: {self.resume_image_path}")
+        image_path = Path(resume_image_path).expanduser().resolve() if resume_image_path else None
+        self.resume_image_path = image_path if image_path and image_path.is_file() else None
         self._tool_lock = asyncio.Lock()
         self.tools = self._build_tools()
 

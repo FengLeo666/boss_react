@@ -1,7 +1,7 @@
 [project]
 name = "boss-react"
 version = "0.1.0"
-description = "Nodriver and Playwright browser tools exposed through LangChain middleware"
+description = "Nodriver-backed BOSS browser tools exposed through LangChain middleware"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -9,7 +9,6 @@ dependencies = [
     "langchain-openai>=1.1,<2",
     "langgraph-checkpoint-sqlite>=3.1.1",
     "nodriver>=0.48.1",
-    "playwright>=1.58,<2",
     "prompt-toolkit>=3.0,<4",
     "python-dotenv>=1.1,<2",
 ]

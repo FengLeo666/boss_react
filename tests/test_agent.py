@@ -28,7 +28,7 @@ from boss_react.context_compaction import (
     resume_message,
     task_message,
 )
-from boss_react.nodriver_middleware import NodriverBrowserMiddleware
+from boss_react.nodriver_middleware import BossReactMiddleware
 
 
 def _write_config(tmp_path: Path, *, task: str = "") -> Path:
@@ -90,6 +90,40 @@ def test_settings_resolve_paths_and_context_limits(tmp_path: Path) -> None:
     assert settings.recursion_limit == 25
     assert settings.log_level == "DEBUG"
     assert settings.log_file == tmp_path / "logs" / "test.log"
+
+
+def test_missing_resume_image_path_is_treated_as_disabled(tmp_path: Path) -> None:
+    config = _write_config(tmp_path)
+    content = config.read_text(encoding="utf-8")
+    config.write_text(
+        content.replace(
+            'resume_text_path = "resume.txt"',
+            'resume_text_path = "resume.txt"\nresume_image_path = "resume.jpg"',
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_agent_settings(config)
+
+    assert settings.resume_image_path is None
+
+
+def test_existing_resume_image_path_remains_enabled(tmp_path: Path) -> None:
+    config = _write_config(tmp_path)
+    image = tmp_path / "resume.jpg"
+    image.write_bytes(b"image")
+    content = config.read_text(encoding="utf-8")
+    config.write_text(
+        content.replace(
+            'resume_text_path = "resume.txt"',
+            'resume_text_path = "resume.txt"\nresume_image_path = "resume.jpg"',
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_agent_settings(config)
+
+    assert settings.resume_image_path == image
 
 
 def test_initial_messages_put_resume_first_and_task_second(tmp_path: Path) -> None:
@@ -223,7 +257,7 @@ def test_build_agent_installs_compactor_before_browser(
         async def start(self):
             return {"event": "ready"}
 
-    browser = NodriverBrowserMiddleware(session=Session())
+    browser = BossReactMiddleware(session=Session())
     captured = {}
 
     def fake_create_agent(**kwargs):
@@ -712,7 +746,7 @@ async def test_cli_new_switch_and_list_chats_use_separate_sqlite_threads(
         async def close(self):
             return None
 
-    browser = NodriverBrowserMiddleware(session=Session())
+    browser = BossReactMiddleware(session=Session())
 
     def build_fake_agent(_settings, *, checkpointer):
         graph = create_agent(

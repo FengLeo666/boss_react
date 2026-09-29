@@ -14,7 +14,7 @@ from langchain_openai import ChatOpenAI
 from .agent_config import AgentSettings, read_required_text
 from .context_compaction import AgentNodeCompactionMiddleware, resume_message, task_message
 from .nodriver import NodriverBrowserConfig
-from .nodriver_middleware import NodriverBrowserMiddleware
+from .nodriver_middleware import BossReactMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +84,12 @@ def build_agent(
     settings: AgentSettings,
     *,
     model: ChatOpenAI | None = None,
-    browser_middleware: NodriverBrowserMiddleware | None = None,
+    browser_middleware: BossReactMiddleware | None = None,
     checkpointer: Any | None = None,
-) -> tuple[Any, NodriverBrowserMiddleware]:
+) -> tuple[Any, BossReactMiddleware]:
     """Create the LangChain agent and return it with its retained browser middleware."""
     chat_model = model or build_model(settings)
-    browser = browser_middleware or NodriverBrowserMiddleware(
+    browser = browser_middleware or BossReactMiddleware(
         NodriverBrowserConfig(
             python_executable=settings.project_root / ".venv" / "Scripts" / "python.exe",
             profile_dir=settings.browser_profile_path,

@@ -57,7 +57,8 @@ def _resolve_optional(config_dir: Path, raw: Any) -> Path | None:
     if not value:
         return None
     path = Path(value).expanduser()
-    return (config_dir / path).resolve() if not path.is_absolute() else path.resolve()
+    resolved = (config_dir / path).resolve() if not path.is_absolute() else path.resolve()
+    return resolved if resolved.is_file() else None
 
 
 def _positive_int(raw: Any, *, field_name: str, default: int) -> int:

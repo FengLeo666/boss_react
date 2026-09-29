@@ -10,7 +10,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from boss_react import NodriverBrowserConfig, NodriverBrowserMiddleware
+from boss_react import NodriverBrowserConfig, BossReactMiddleware
 from boss_react.nodriver import NodriverToolError
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
@@ -61,11 +61,11 @@ class FakeNodriverSession:
 
 
 @pytest.fixture
-def fake_middleware(tmp_path: Path) -> tuple[NodriverBrowserMiddleware, FakeNodriverSession]:
+def fake_middleware(tmp_path: Path) -> tuple[BossReactMiddleware, FakeNodriverSession]:
     screenshot = tmp_path / "shot.png"
     screenshot.write_bytes(b"png-bytes")
     session = FakeNodriverSession(screenshot)
-    return NodriverBrowserMiddleware(session=session), session
+    return BossReactMiddleware(session=session), session
 
 
 def test_nodriver_config_resolves_local_project_defaults() -> None:
@@ -92,7 +92,7 @@ def test_normalize_patterns_accepts_model_compatible_shapes(raw, expected) -> No
 
 
 def test_middleware_registers_all_unrestricted_tools(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, _ = fake_middleware
     names = {item.name for item in middleware.tools}
@@ -107,7 +107,7 @@ def test_middleware_registers_all_unrestricted_tools(
 
 @pytest.mark.asyncio
 async def test_text_click_and_javascript_are_forwarded_without_filtering(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     tools = {item.name: item for item in middleware.tools}
@@ -130,7 +130,7 @@ async def test_text_click_and_javascript_are_forwarded_without_filtering(
 
 @pytest.mark.asyncio
 async def test_greeting_tool_remains_available_and_forwards_calls(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     tools = {item.name: item for item in middleware.tools}
@@ -146,7 +146,7 @@ async def test_configured_resume_image_exposes_zero_argument_send_tool(tmp_path:
     resume_image = tmp_path / "resume.png"
     resume_image.write_bytes(b"png")
     session = FakeNodriverSession(tmp_path / "shot.png")
-    middleware = NodriverBrowserMiddleware(
+    middleware = BossReactMiddleware(
         session=session,
         resume_image_path=resume_image,
     )
@@ -158,17 +158,19 @@ async def test_configured_resume_image_exposes_zero_argument_send_tool(tmp_path:
     assert session.calls == [("boss_send_image", {"path": str(resume_image)})]
 
 
-def test_missing_configured_resume_image_fails_early(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="Configured resume image"):
-        NodriverBrowserMiddleware(
-            session=FakeNodriverSession(tmp_path / "shot.png"),
-            resume_image_path=tmp_path / "missing.png",
-        )
+def test_missing_configured_resume_image_disables_send_tool(tmp_path: Path) -> None:
+    middleware = BossReactMiddleware(
+        session=FakeNodriverSession(tmp_path / "shot.png"),
+        resume_image_path=tmp_path / "missing.png",
+    )
+
+    assert middleware.resume_image_path is None
+    assert "boss_send_image" not in {tool.name for tool in middleware.tools}
 
 
 @pytest.mark.asyncio
 async def test_state_returns_state_and_screenshot_as_multimodal_content(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     state_tool = next(item for item in middleware.tools if item.name == "browser_state")
@@ -188,7 +190,7 @@ async def test_state_returns_state_and_screenshot_as_multimodal_content(
 
 @pytest.mark.asyncio
 async def test_observe_forwards_pattern_matching_options(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     observe_tool = next(item for item in middleware.tools if item.name == "browser_observe")
@@ -213,7 +215,7 @@ async def test_observe_forwards_pattern_matching_options(
 
 @pytest.mark.asyncio
 async def test_lifecycle_starts_and_closes_the_retained_session(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
 
@@ -226,7 +228,7 @@ async def test_lifecycle_starts_and_closes_the_retained_session(
 
 
 async def test_manual_compaction_does_not_start_browser(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
 
@@ -238,7 +240,7 @@ async def test_manual_compaction_does_not_start_browser(
 
 @pytest.mark.asyncio
 async def test_every_tool_result_gets_one_post_action_screenshot(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     request = SimpleNamespace(tool_call={"id": "call-1", "name": "browser_state", "args": {}})
@@ -261,7 +263,7 @@ async def test_every_tool_result_gets_one_post_action_screenshot(
 
 @pytest.mark.asyncio
 async def test_failed_tool_also_returns_post_action_screenshot(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     request = SimpleNamespace(tool_call={"id": "call-2", "name": "browser_click_text", "args": {}})
@@ -279,7 +281,7 @@ async def test_failed_tool_also_returns_post_action_screenshot(
 
 @pytest.mark.asyncio
 async def test_named_javascript_is_checkpointed_and_reused_after_middleware_restart(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     seen: list[dict[str, Any]] = []
@@ -297,7 +299,7 @@ async def test_named_javascript_is_checkpointed_and_reused_after_middleware_rest
     assert saved.update["js_cache"] == {"find_jobs": "return 42"}
     assert saved.update["messages"][0].content[-1]["type"] == "image"
 
-    resumed = NodriverBrowserMiddleware(session=session)
+    resumed = BossReactMiddleware(session=session)
     replay = ToolCallRequest(
         tool_call={"name": "browser_eval_js", "args": {"name": "find_jobs"}, "id": "second"},
         tool=None, state={"messages": [], "js_cache": saved.update["js_cache"]}, runtime=None,
@@ -317,7 +319,7 @@ async def test_named_javascript_is_checkpointed_and_reused_after_middleware_rest
 
 @pytest.mark.asyncio
 async def test_unknown_javascript_name_fails_without_running_script(
-    fake_middleware: tuple[NodriverBrowserMiddleware, FakeNodriverSession],
+    fake_middleware: tuple[BossReactMiddleware, FakeNodriverSession],
 ) -> None:
     middleware, session = fake_middleware
     request = ToolCallRequest(
@@ -353,7 +355,7 @@ async def test_javascript_cache_survives_sqlite_checkpoint_restart(tmp_path: Pat
             AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs", "script": "return 42"}, "id": "js-1"}]),
             AIMessage(content="saved"),
         ])
-        first_agent = create_agent(first_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        first_agent = create_agent(first_model, middleware=[BossReactMiddleware(session=session)], checkpointer=saver)
         first = await first_agent.ainvoke({"messages": [HumanMessage(content="run named JS")]}, config=config)
         assert first["js_cache"] == {"count_jobs": "return 42"}
 
@@ -361,7 +363,7 @@ async def test_javascript_cache_survives_sqlite_checkpoint_restart(tmp_path: Pat
             AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs"}, "id": "js-2"}]),
             AIMessage(content="reused"),
         ])
-        second_agent = create_agent(second_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        second_agent = create_agent(second_model, middleware=[BossReactMiddleware(session=session)], checkpointer=saver)
         second = await second_agent.ainvoke({"messages": [HumanMessage(content="reuse named JS")]}, config=config)
         assert second["js_cache"] == {"count_jobs": "return 42"}
 
@@ -369,7 +371,7 @@ async def test_javascript_cache_survives_sqlite_checkpoint_restart(tmp_path: Pat
             AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs", "script": "return 99"}, "id": "js-3"}]),
             AIMessage(content="updated"),
         ])
-        update_agent = create_agent(update_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        update_agent = create_agent(update_model, middleware=[BossReactMiddleware(session=session)], checkpointer=saver)
         updated = await update_agent.ainvoke({"messages": [HumanMessage(content="replace named JS")]}, config=config)
         assert updated["js_cache"] == {"count_jobs": "return 99"}
 
@@ -377,7 +379,7 @@ async def test_javascript_cache_survives_sqlite_checkpoint_restart(tmp_path: Pat
             AIMessage(content="", tool_calls=[{"name": "browser_eval_js", "args": {"name": "count_jobs"}, "id": "js-4"}]),
             AIMessage(content="replayed update"),
         ])
-        replay_agent = create_agent(replay_model, middleware=[NodriverBrowserMiddleware(session=session)], checkpointer=saver)
+        replay_agent = create_agent(replay_model, middleware=[BossReactMiddleware(session=session)], checkpointer=saver)
         final = await replay_agent.ainvoke({"messages": [HumanMessage(content="reuse updated JS")]}, config=config)
 
     assert final["js_cache"] == {"count_jobs": "return 99"}
