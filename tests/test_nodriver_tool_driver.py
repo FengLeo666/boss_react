@@ -24,6 +24,7 @@ class FakeTab:
         self.stuck = stuck
         self.activate = AsyncMock()
         self.bring_to_front = AsyncMock()
+        self.close = AsyncMock()
         self.handlers: dict[type, list] = {}
 
     def add_handler(self, event_type: type, callback) -> None:
@@ -53,6 +54,10 @@ def make_session(tmp_path: Path, tabs: list[FakeTab]) -> tuple[object, list[Fake
     )
     session = driver.NodriverToolSession(backend, tmp_path)
     session.state = AsyncMock(return_value={"page_state": {"kind": "chat"}})
+    for tab in tabs:
+        async def close_tab(tab_to_close: FakeTab = tab) -> None:
+            tabs.remove(tab_to_close)
+        tab.close.side_effect = close_tab
     return session, active
 
 
@@ -111,6 +116,144 @@ async def test_screenshot_recovers_from_stuck_hidden_target(
     assert active[0] is visible
     visible.activate.assert_awaited_once_with()
     visible.bring_to_front.assert_awaited_once_with()
+    hidden.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_new_tab_replaces_old_tab(tmp_path: Path) -> None:
+    old = FakeTab("list", "visible")
+    new = FakeTab("detail", "visible")
+    tabs = [old]
+    session, active = make_session(tmp_path, tabs)
+    tabs.append(new)
+    new.close.side_effect = lambda: tabs.remove(new)
+
+    assert await session._adopt_new_tab({"list"}) is True
+
+    assert active[0] is new
+    assert tabs == [new]
+    old.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_screenshot_adopts_tab_opened_after_click_returns(tmp_path: Path) -> None:
+    old = FakeTab("list", "visible")
+    new = FakeTab("detail", "visible")
+    session, active = make_session(tmp_path, [old, new])
+
+    result = await session.screenshot()
+
+    assert result["target_id"] == "detail"
+    assert active[0] is new
+    old.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_closed_tab_is_removed_before_next_screenshot(tmp_path: Path) -> None:
+    old = FakeTab("list", "hidden")
+    new = FakeTab("detail", "visible")
+    tabs = [old, new]
+    session, active = make_session(tmp_path, tabs)
+    old.close.side_effect = None
+
+    async def refresh_targets() -> None:
+        if old.close.await_count and old in tabs:
+            tabs.remove(old)
+
+    session.browser.update_targets.side_effect = refresh_targets
+
+    first = await session.screenshot()
+    second = await session.screenshot()
+
+    assert first["target_id"] == second["target_id"] == "detail"
+    assert active[0] is new
+    assert tabs == [new]
+    old.close.assert_awaited_once_with()
+    old.activate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_new_tab_recovers_hidden_page_screenshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(driver, "SCREENSHOT_TIMEOUT_SECONDS", 0.01)
+    old = FakeTab("list", "hidden")
+    new = FakeTab("detail", "hidden")
+    tabs = [old]
+    session, active = make_session(tmp_path, tabs)
+
+    async def open_late_tab(_command: object) -> str:
+        if new not in tabs:
+            tabs.append(new)
+        await asyncio.Event().wait()
+        return ""
+
+    old.send = open_late_tab  # type: ignore[method-assign]
+
+    result = await session.screenshot()
+
+    assert result["target_id"] == "detail"
+    assert active[0] is new
+    assert tabs == [new]
+
+
+@pytest.mark.asyncio
+async def test_failed_activation_keeps_current_page(tmp_path: Path) -> None:
+    old = FakeTab("list", "visible")
+    new = FakeTab("detail", "visible")
+    session, active = make_session(tmp_path, [old, new])
+    new.activate.side_effect = RuntimeError("Session with given id not found")
+
+    with pytest.raises(driver.BrowserToolTimeout, match="Browser page session is gone"):
+        await session.screenshot()
+
+    assert active[0] is old
+    old.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reset_discards_closed_target_before_screenshot(tmp_path: Path) -> None:
+    old = FakeTab("detail", "visible")
+    home = FakeTab("home", "visible")
+    tabs = [old]
+    session, active = make_session(tmp_path, tabs)
+    old.close.side_effect = RuntimeError("Session with given id not found")
+
+    async def open_home(_url: str, *, new_tab: bool) -> FakeTab:
+        assert new_tab is True
+        tabs.append(home)
+        return home
+
+    async def refresh_targets() -> None:
+        if old.close.await_count and old in tabs:
+            tabs.remove(old)
+
+    session.browser.get = AsyncMock(side_effect=open_home)
+    session.browser.update_targets.side_effect = refresh_targets
+
+    await session.reset()
+    result = await session.screenshot()
+
+    assert result["target_id"] == "home"
+    assert active[0] is home
+    assert tabs == [home]
+    old.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_back_without_history_returns_tool_error(tmp_path: Path) -> None:
+    tab = FakeTab("detail", "visible")
+    tab.send = AsyncMock(return_value=(0, []))  # type: ignore[method-assign]
+    session, _ = make_session(tmp_path, [tab])
+
+    result = await driver._execute_tool_request(
+        session, {"browser_back": session.back},
+        {"request_id": 43, "tool": "browser_back", "args": {}}, timeout=5,
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "RuntimeError"
+    assert "No previous page" in result["error"]
 
 
 @pytest.mark.asyncio

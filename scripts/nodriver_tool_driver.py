@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 
 HOME_URL = "https://www.zhipin.com/"
 LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login"
-MAX_TABS = 10
 SCREENSHOT_TIMEOUT_SECONDS = 12
 NETWORK_IDLE_TIMEOUT_SECONDS = 6
 NETWORK_QUIET_SECONDS = 0.5
@@ -137,8 +136,6 @@ class NodriverToolSession:
         self.artifacts = artifacts.resolve()
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.screenshot_counter = 0
-        self.return_stack: list[str] = []
-        self.tab_order: list[str] = []
 
     @property
     def tab(self):
@@ -162,58 +159,57 @@ class NodriverToolSession:
         return {self._tab_id(tab): tab for tab in self.browser.tabs}
 
     async def initialize_tabs(self) -> None:
-        """Register existing page targets without exposing them to the agent."""
-        current_id = self._tab_id(self.tab)
-        self.tab_order = [self._tab_id(tab) for tab in self.browser.tabs]
-        if current_id in self.tab_order:
-            self.tab_order.remove(current_id)
-        self.tab_order.append(current_id)
-        await self._enforce_tab_limit()
+        """Keep the active page and discard other existing pages."""
+        await self._close_old_tabs(self.tab)
 
     async def _activate(self, tab: Any) -> None:
+        try:
+            await tab.activate()
+            await tab.bring_to_front()
+        except Exception as exc:
+            if "Session with given id not found" in str(exc):
+                raise BrowserToolTimeout(f"Browser page session is gone: {self._tab_id(tab)}") from exc
+            raise
         self.backend.set_tab(tab)
-        await tab.activate()
-        await tab.bring_to_front()
-        tab_id = self._tab_id(tab)
-        if tab_id in self.tab_order:
-            self.tab_order.remove(tab_id)
-        self.tab_order.append(tab_id)
 
-    async def _close_tab(self, tab: Any) -> None:
-        tab_id = self._tab_id(tab)
-        await tab.close()
-        self.tab_order = [item for item in self.tab_order if item != tab_id]
-        self.return_stack = [item for item in self.return_stack if item != tab_id]
-
-    async def _enforce_tab_limit(self) -> None:
-        """Keep at most MAX_TABS page targets, closing the oldest background page."""
-        while len(self.browser.tabs) > MAX_TABS:
-            tabs = self._tabs_by_id()
-            current_id = self._tab_id(self.tab)
-            candidate_id = next((item for item in self.tab_order if item in tabs and item != current_id), None)
-            if candidate_id is None:
-                candidate_id = next((item for item in tabs if item != current_id), None)
-            if candidate_id is None:
-                break
-            await self._close_tab(tabs[candidate_id])
+    async def _close_old_tabs(self, active: Any) -> None:
+        active_id = self._tab_id(active)
+        old_tabs = [tab for tab in self.browser.tabs if self._tab_id(tab) != active_id]
+        if not old_tabs:
+            return
+        old_ids = {self._tab_id(tab) for tab in old_tabs}
+        for tab in old_tabs:
+            try:
+                await tab.close()
+            except Exception as exc:
+                if "Session with given id not found" not in str(exc):
+                    raise
+                logger.warning("旧页面会话已失效: target_id=%s", self._tab_id(tab))
+        for _ in range(30):
+            await self.browser.update_targets()
+            if not old_ids.intersection(self._tabs_by_id()):
+                return
             await asyncio.sleep(0.1)
+        raise BrowserToolTimeout("Closed browser pages remained in CDP targets")
 
     async def _adopt_new_tab(self, before_ids: set[str]) -> bool:
         """Switch to a page target created by the preceding action."""
         for _ in range(12):
             new_tabs = [tab for tab in self.browser.tabs if self._tab_id(tab) not in before_ids]
             if new_tabs:
-                previous_id = self._tab_id(self.tab)
-                if previous_id not in self.return_stack:
-                    self.return_stack.append(previous_id)
-                for tab in new_tabs:
-                    tab_id = self._tab_id(tab)
-                    if tab_id not in self.tab_order:
-                        self.tab_order.append(tab_id)
                 await self._activate(new_tabs[-1])
-                await self._enforce_tab_limit()
+                await self._close_old_tabs(new_tabs[-1])
                 return True
             await asyncio.sleep(0.1)
+        return False
+
+    async def _adopt_extra_tab(self) -> bool:
+        current_id = self._tab_id(self.tab)
+        new_tabs = [tab for tab in self.browser.tabs if self._tab_id(tab) != current_id]
+        if new_tabs:
+            await self._activate(new_tabs[-1])
+            await self._close_old_tabs(new_tabs[-1])
+            return True
         return False
 
     async def _evaluate(self, expression: str) -> dict[str, Any]:
@@ -661,45 +657,19 @@ class NodriverToolSession:
         from nodriver import cdp
 
         current = self.tab
-        current_id = self._tab_id(current)
         current_index, entries = await current.send(cdp.page.get_navigation_history())
         if current_index > 0:
             await current.send(cdp.page.navigate_to_history_entry(entries[current_index - 1].id_))
             await asyncio.sleep(1)
             return {"ok": True, "back_mode": "history", **await self.state()}
 
-        tabs = self._tabs_by_id()
-        previous = None
-        while self.return_stack and previous is None:
-            candidate_id = self.return_stack.pop()
-            if candidate_id != current_id:
-                previous = tabs.get(candidate_id)
-        if previous is None:
-            previous_id = next(
-                (item for item in reversed(self.tab_order) if item != current_id and item in tabs),
-                None,
-            )
-            previous = tabs.get(previous_id) if previous_id else None
-
-        if previous is not None:
-            await self._activate(previous)
-            await self._close_tab(current)
-            await asyncio.sleep(0.5)
-            return {"ok": True, "back_mode": "previous_tab", **await self.state()}
-
-        await current.get(HOME_URL)
-        await asyncio.sleep(1)
-        return {"ok": True, "back_mode": "homepage", **await self.state()}
+        raise RuntimeError("No previous page in this tab's navigation history")
 
     async def reset(self) -> dict[str, Any]:
-        """Replace every page target with one clean BOSS homepage target."""
+        """Open a new homepage and close previous pages."""
         homepage = await self.browser.get(HOME_URL, new_tab=True)
         await self._activate(homepage)
-        for tab in list(self.browser.tabs):
-            if self._tab_id(tab) != self._tab_id(homepage):
-                await self._close_tab(tab)
-        self.return_stack.clear()
-        self.tab_order = [self._tab_id(homepage)]
+        await self._close_old_tabs(homepage)
         await asyncio.sleep(1)
         return {"ok": True, "reset": True, **await self.state()}
 
@@ -750,8 +720,9 @@ class NodriverToolSession:
     async def screenshot(self) -> dict[str, Any]:
         from nodriver import cdp
 
+        await self._adopt_extra_tab()
         self.screenshot_counter += 1
-        path = self.artifacts / f"nodriver-screenshot-{self.screenshot_counter:04d}.png"
+        path = self.artifacts / f"screenshot-{self.screenshot_counter:04d}.png"
         tab = self.tab
         target_id = self._tab_id(tab)
 
@@ -776,22 +747,14 @@ class NodriverToolSession:
                 raise BrowserToolTimeout(f"Screenshot timed out for target {target_id}") from exc
 
             await asyncio.wait_for(self.browser.update_targets(), timeout=3)
-            replacement = None
-            for candidate in self.browser.tabs:
-                if self._tab_id(candidate) == target_id:
-                    continue
-                try:
-                    state = await asyncio.wait_for(candidate.evaluate("document.visibilityState"), timeout=2)
-                except Exception:
-                    continue
-                if state == "visible":
-                    replacement = candidate
-                    break
-            if replacement is None:
-                raise BrowserToolTimeout(f"Screenshot timed out for hidden target {target_id}; no visible page") from exc
-            await asyncio.wait_for(self._activate(replacement), timeout=3)
-            tab = replacement
-            logger.warning("截图切换到可见页面: old_target_id=%s target_id=%s", target_id, self._tab_id(tab))
+            try:
+                adopted = await asyncio.wait_for(self._adopt_extra_tab(), timeout=3)
+            except Exception as activate_exc:
+                raise BrowserToolTimeout(f"New page could not be activated after screenshot timeout: {activate_exc}") from activate_exc
+            if not adopted:
+                raise BrowserToolTimeout(f"Screenshot timed out for hidden target {target_id}; no new page") from exc
+            tab = self.tab
+            logger.warning("截图切换到新页面: old_target_id=%s target_id=%s", target_id, self._tab_id(tab))
             image = await capture(tab)
 
         path.write_bytes(image)
