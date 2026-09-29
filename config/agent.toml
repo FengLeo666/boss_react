@@ -1,0 +1,34 @@
+[agent]
+# Leave empty to ask for the task in the terminal at startup.
+task = ""
+system_prompt_path = "system_prompt.txt"
+resume_text_path = "resume.txt"
+# Optional. When set, exposes a zero-argument tool that sends this resume image.
+resume_image_path = "resume.jpg"
+
+[model]
+env_file = "../.env"
+# Long context and summarization requests can take several minutes.
+request_timeout_seconds = 300
+
+[browser]
+profile_dir = "../browser-profile/nodriver"
+# Screenshots and page transitions can remain pending while BOSS loads a job detail.
+action_timeout_seconds = 120
+
+[context]
+# Compact the checkpoint before an agent run after this approximate token count.
+summary_trigger_tokens = 800000
+# Also compact when checkpointed screenshots reach this count.
+summary_trigger_images = 255
+
+[checkpoint]
+# Reuse this SQLite-backed LangGraph thread on every launch.
+database_path = "../data/checkpoints.sqlite"
+thread_id = "boss-react-v2"
+
+[runtime]
+recursion_limit = 1200000
+debug = false
+log_level = "INFO"
+log_file = "../logs/boss-react.log"
