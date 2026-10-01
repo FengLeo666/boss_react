@@ -47,9 +47,20 @@ async def _read_enhanced_task() -> str:
     )
 
 
+def _announce_input(task: str) -> None:
+    if not task:
+        return
+    if task.startswith("/"):
+        command = task.partition("\n")[0][:80]
+        print(f"[命令] 已收到 {command}，开始执行。", flush=True)
+    else:
+        print("[输入] 已收到。开始处理。", flush=True)
+
+
 async def resolve_task(settings: AgentSettings, override: str | None = None) -> str:
     task = (override or settings.task).strip()
     if task:
+        _announce_input(task)
         return task
     task = await _read_next_input()
     if not task:
@@ -61,13 +72,13 @@ async def _read_next_input() -> str:
     try:
         task = await _read_enhanced_task()
     except EOFError:
+        _announce_input("/exit")
         return "/exit"
     except Exception as exc:  # noqa: BLE001
         logger.warning("当前控制台不支持增强粘贴输入，回退为空行提交模式: %s", exc)
         task = _read_task_until_blank_line()
     task = task.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if task and task.lower() != "/exit":
-        print("[输入] 已收到。", flush=True)
+    _announce_input(task)
     return task
 
 

@@ -172,6 +172,28 @@ async def test_interactive_task_accepts_multiple_lines(
     assert "[输入] 已收到。" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("command", ["/exit", "/chats", "/compact", "/run forever", "/new chat abc"])
+async def test_interactive_commands_are_acknowledged_before_returning(
+    command: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    async def fake_prompt() -> str:
+        return command
+
+    monkeypatch.setattr(cli_module, "_read_enhanced_task", fake_prompt)
+
+    assert await cli_module._read_next_input() == command
+    assert f"[命令] 已收到 {command}，开始执行。" in capsys.readouterr().out
+
+
+async def test_configured_command_is_acknowledged_before_dispatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    settings = load_agent_settings(_write_config(tmp_path, task="/exit"))
+
+    assert await resolve_task(settings) == "/exit"
+    assert "[命令] 已收到 /exit，开始执行。" in capsys.readouterr().out
+
+
 async def test_cli_override_wins_over_configured_task(tmp_path: Path) -> None:
     settings = load_agent_settings(_write_config(tmp_path, task="Configured task"))
 
