@@ -369,7 +369,7 @@ class BossReactMiddleware(AgentMiddleware):
 
         @tool("browser_eval_js")
         async def browser_eval_js(name: str, script: str | None = None) -> dict[str, Any]:
-            """Run JavaScript in the active page. Give a reusable name and script to cache it; later pass only name to rerun it. 你可以cache一些机械且重复的代码方便后续快速调用。Use return for JSON-serializable results."""
+            """Run JavaScript in the active page. First call: pass name and script to cache the code. Reuse: pass only name and omit script entirely; do not resend unchanged code. Update: pass the same name with a new script to overwrite the cache. Return JSON-serializable results."""
             if script is None:
                 raise ValueError("Cached JavaScript must be resolved by the agent middleware")
             return await model_safe_call("browser_eval_js", script=script)
