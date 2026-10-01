@@ -212,6 +212,25 @@ class NodriverToolSession:
             return True
         return False
 
+    async def _restore_hidden_tab(self, tab: Any) -> None:
+        from nodriver import cdp
+
+        target_id = self._tab_id(tab)
+        try:
+            window_id, bounds = await asyncio.wait_for(tab.get_window(), timeout=3)
+            if bounds.window_state == cdp.browser.WindowState.MINIMIZED:
+                await asyncio.wait_for(
+                    tab.send(cdp.browser.set_window_bounds(
+                        window_id, cdp.browser.Bounds(window_state=cdp.browser.WindowState.NORMAL)
+                    )),
+                    timeout=3,
+                )
+                logger.warning("已还原最小化的浏览器窗口: target_id=%s", target_id)
+        except Exception as exc:
+            logger.warning("读取或还原浏览器窗口状态失败: target_id=%s error=%s", target_id, exc)
+        await asyncio.wait_for(self._activate(tab), timeout=3)
+        logger.info("已重新激活隐藏页面: target_id=%s", target_id)
+
     async def _evaluate(self, expression: str) -> dict[str, Any]:
         result = await self.backend.safe_evaluate(expression, timeout=15)
         if not isinstance(result, dict):
@@ -724,7 +743,12 @@ class NodriverToolSession:
         self.screenshot_counter += 1
         path = self.artifacts / f"screenshot-{self.screenshot_counter:04d}.png"
         tab = self.tab
-        target_id = self._tab_id(tab)
+
+        async def visibility_state(target: Any) -> str | None:
+            try:
+                return await asyncio.wait_for(target.evaluate("document.visibilityState"), timeout=2)
+            except Exception:
+                return None
 
         async def capture(target: Any) -> bytes:
             data = await asyncio.wait_for(
@@ -735,14 +759,19 @@ class NodriverToolSession:
                 raise RuntimeError(f"Screenshot returned no data for target {self._tab_id(target)}")
             return base64.b64decode(data)
 
+        if await visibility_state(tab) == "hidden":
+            await asyncio.wait_for(self.browser.update_targets(), timeout=3)
+            if await self._adopt_extra_tab():
+                tab = self.tab
+            else:
+                await self._restore_hidden_tab(tab)
+
         try:
             image = await capture(tab)
         except TimeoutError as exc:
+            target_id = self._tab_id(tab)
             logger.warning("截图超时: target_id=%s", target_id)
-            try:
-                visibility = await asyncio.wait_for(tab.evaluate("document.visibilityState"), timeout=2)
-            except Exception:
-                visibility = None
+            visibility = await visibility_state(tab)
             if visibility != "hidden":
                 raise BrowserToolTimeout(f"Screenshot timed out for target {target_id}") from exc
 
@@ -752,10 +781,13 @@ class NodriverToolSession:
             except Exception as activate_exc:
                 raise BrowserToolTimeout(f"New page could not be activated after screenshot timeout: {activate_exc}") from activate_exc
             if not adopted:
-                raise BrowserToolTimeout(f"Screenshot timed out for hidden target {target_id}; no new page") from exc
+                await self._restore_hidden_tab(tab)
             tab = self.tab
-            logger.warning("截图切换到新页面: old_target_id=%s target_id=%s", target_id, self._tab_id(tab))
-            image = await capture(tab)
+            logger.warning("截图恢复页面: old_target_id=%s target_id=%s adopted=%s", target_id, self._tab_id(tab), adopted)
+            try:
+                image = await capture(tab)
+            except TimeoutError as retry_exc:
+                raise BrowserToolTimeout(f"Screenshot timed out after restoring target {self._tab_id(tab)}") from retry_exc
 
         path.write_bytes(image)
         return {"ok": True, "path": str(path), "target_id": self._tab_id(tab), **await self.state()}

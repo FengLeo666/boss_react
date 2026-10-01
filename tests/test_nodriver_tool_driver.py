@@ -284,3 +284,67 @@ async def test_visible_screenshot_timeout_requires_browser_restart(
 
     with pytest.raises(driver.BrowserToolTimeout, match="target chat"):
         await session.screenshot()
+
+
+@pytest.mark.asyncio
+async def test_hidden_only_tab_restores_minimized_window_before_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodriver import cdp
+
+    monkeypatch.setattr(driver, "SCREENSHOT_TIMEOUT_SECONDS", 0.01)
+    tab = FakeTab("job-list", "hidden", stuck=True)
+    tab.get_window = AsyncMock(return_value=(  # type: ignore[attr-defined]
+        cdp.browser.WindowID(1),
+        cdp.browser.Bounds(window_state=cdp.browser.WindowState.MINIMIZED),
+    ))
+
+    async def send(command: object) -> str:
+        if command.gi_code.co_name == "set_window_bounds":  # type: ignore[attr-defined]
+            tab.stuck = False
+            tab.visibility = "visible"
+            return ""
+        if tab.stuck:
+            await asyncio.Event().wait()
+        return base64.b64encode(b"png-data").decode("ascii")
+
+    tab.send = send  # type: ignore[method-assign]
+    session, active = make_session(tmp_path, [tab])
+
+    result = await session.screenshot()
+
+    assert result["target_id"] == "job-list"
+    assert active[0] is tab
+    assert Path(result["path"]).read_bytes() == b"png-data"
+    tab.get_window.assert_awaited()  # type: ignore[attr-defined]
+    tab.activate.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hidden_only_tab_reactivates_when_window_is_not_minimized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodriver import cdp
+
+    monkeypatch.setattr(driver, "SCREENSHOT_TIMEOUT_SECONDS", 0.01)
+    tab = FakeTab("home", "hidden", stuck=True)
+    tab.get_window = AsyncMock(return_value=(  # type: ignore[attr-defined]
+        cdp.browser.WindowID(1),
+        cdp.browser.Bounds(window_state=cdp.browser.WindowState.NORMAL),
+    ))
+
+    async def activate() -> None:
+        tab.stuck = False
+        tab.visibility = "visible"
+
+    tab.activate.side_effect = activate
+    session, active = make_session(tmp_path, [tab])
+
+    for _ in range(25):
+        tab.stuck = True
+        tab.visibility = "hidden"
+        result = await session.screenshot()
+        assert Path(result["path"]).read_bytes() == b"png-data"
+        assert active[0] is tab
+
+    assert tab.activate.await_count == 25
