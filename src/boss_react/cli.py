@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphDrained
 from langgraph.runtime import RunControl
 from prompt_toolkit import PromptSession
@@ -23,6 +22,7 @@ from .agent_config import AgentSettings, load_agent_settings
 from .context_compaction import task_message
 from .console_output import finish_model_text, print_markdown, show_banner, stream_model_text
 from .logging_config import configure_logging
+from .shallow_sqlite import AsyncShallowSqliteSaver as AsyncSqliteSaver
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "agent.toml"
 logger = logging.getLogger(__name__)
