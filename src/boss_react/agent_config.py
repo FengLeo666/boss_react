@@ -94,7 +94,7 @@ def load_agent_settings(path: str | Path) -> AgentSettings:
         context.get("summary_trigger_tokens"), field_name="summary_trigger_tokens", default=32_000
     )
     image_trigger = _positive_int(
-        context.get("summary_trigger_images"), field_name="summary_trigger_images", default=255
+        context.get("summary_trigger_images"), field_name="summary_trigger_images", default=249
     )
     checkpoint_thread_id = str(
         checkpoint.get("thread_id", "boss-react-default")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NotRequired
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -19,7 +19,6 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveM
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
-from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +27,7 @@ _RESUME_ROLE = "resume"
 _TASK_ROLE = "task"
 _COMPACTION_REQUEST_ROLE = "compaction_request"
 _COMPACTED_CONTEXT_ROLE = "compacted_context"
+_MAX_IMAGES_BEFORE_COMPACT = 249
 
 
 class CompactionAgentState(AgentState):
@@ -75,12 +75,35 @@ def _image_count(messages: list[AnyMessage]) -> int:
     )
 
 
+def _trim_oldest_images(messages: list[AnyMessage], keep: int) -> list[AnyMessage]:
+    excess = _image_count(messages) - keep
+    replacements: list[AnyMessage] = []
+    for message in messages:
+        if excess <= 0:
+            break
+        if not isinstance(message.content, list):
+            continue
+        content = []
+        removed = 0
+        for block in message.content:
+            if excess and isinstance(block, dict) and block.get("type") in {"image", "image_url"}:
+                excess -= 1
+                removed += 1
+            else:
+                content.append(block)
+        if removed:
+            if not content:
+                content = [{"type": "text", "text": "[Earlier screenshot omitted for context limit]"}]
+            replacements.append(message.model_copy(update={"content": content}))
+    return replacements
+
+
 class AgentNodeCompactionMiddleware(AgentMiddleware):
     """Compact state through the agent's own model node before normal execution."""
 
     state_schema = CompactionAgentState
 
-    def __init__(self, trigger_tokens: int, trigger_images: int = 255) -> None:
+    def __init__(self, trigger_tokens: int, trigger_images: int = _MAX_IMAGES_BEFORE_COMPACT) -> None:
         if trigger_tokens <= 0:
             raise ValueError("trigger_tokens must be positive")
         if trigger_images <= 0:
@@ -93,23 +116,35 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
         self, state: dict[str, Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         del runtime
+        return self._maybe_compact(state, "before_agent")
+
+    def before_model(
+        self, state: dict[str, Any], runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        del runtime
+        return self._maybe_compact(state, "before_model")
+
+    def _maybe_compact(self, state: dict[str, Any], hook: str) -> dict[str, Any] | None:
         messages = state["messages"]
         total_tokens = count_tokens_approximately(messages)
         total_images = _image_count(messages)
+        image_trigger = min(self.trigger_images, _MAX_IMAGES_BEFORE_COMPACT)
         already_requested = any(
             _has_role(message, _COMPACTION_REQUEST_ROLE) for message in messages
         )
         manual = bool(state.get("manual_compact", False))
+        just_compacted = bool(messages) and _has_role(messages[-1], _COMPACTED_CONTEXT_ROLE)
         should_compact = (
-            manual or total_tokens >= self.trigger_tokens or total_images >= self.trigger_images
-        ) and not already_requested
+            manual or total_tokens >= self.trigger_tokens or total_images >= image_trigger
+        ) and not already_requested and (manual or not just_compacted)
         logger.info(
-            "上下文检查(before_agent): messages=%d approx_tokens=%d token_trigger=%d images=%d image_trigger=%d manual=%s compact=%s",
+            "上下文检查(%s): messages=%d approx_tokens=%d token_trigger=%d images=%d image_trigger=%d manual=%s compact=%s",
+            hook,
             len(messages),
             total_tokens,
             self.trigger_tokens,
             total_images,
-            self.trigger_images,
+            image_trigger,
             manual,
             should_compact,
         )
@@ -121,8 +156,12 @@ class AgentNodeCompactionMiddleware(AgentMiddleware):
             "开始上下文压缩: messages=%d approx_tokens=%d images=%d",
             len(messages), total_tokens, total_images,
         )
+        replacements = _trim_oldest_images(messages, _MAX_IMAGES_BEFORE_COMPACT)
+        if replacements:
+            logger.warning("压缩前移除旧截图: count=%d", total_images - _MAX_IMAGES_BEFORE_COMPACT)
         return {
             "messages": [
+                *replacements,
                 HumanMessage(
                     content=COMPACTION_PROMPT,
                     additional_kwargs={_ROLE_KEY: _COMPACTION_REQUEST_ROLE},

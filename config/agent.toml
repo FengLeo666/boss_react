@@ -20,7 +20,7 @@ action_timeout_seconds = 120
 # Compact the checkpoint before an agent run after this approximate token count.
 summary_trigger_tokens = 800000
 # Also compact when checkpointed screenshots reach this count.
-summary_trigger_images = 255
+summary_trigger_images = 249
 
 [checkpoint]
 # Reuse this SQLite-backed LangGraph thread on every launch.

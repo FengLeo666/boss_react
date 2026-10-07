@@ -14,11 +14,11 @@ from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphDrained
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.runtime import RunControl
 
 from boss_react import cli as cli_module
@@ -28,6 +28,7 @@ from boss_react.cli import display_checkpoint_history, resolve_task, run
 from boss_react.context_compaction import (
     COMPACTION_PROMPT,
     AgentNodeCompactionMiddleware,
+    _image_count,
     resume_message,
     task_message,
 )
@@ -59,7 +60,7 @@ action_timeout_seconds = 90
 
 [context]
 summary_trigger_tokens = 1000
-summary_trigger_images = 255
+summary_trigger_images = 249
 
 [checkpoint]
 database_path = "data/checkpoints.sqlite"
@@ -87,7 +88,7 @@ def test_settings_resolve_paths_and_context_limits(tmp_path: Path) -> None:
     assert settings.browser_action_timeout_seconds == 90
     assert settings.request_timeout_seconds == 300
     assert settings.summary_trigger_tokens == 1000
-    assert settings.summary_trigger_images == 255
+    assert settings.summary_trigger_images == 249
     assert settings.checkpoint_database_path == tmp_path / "data" / "checkpoints.sqlite"
     assert settings.checkpoint_thread_id == "test-thread"
     assert settings.recursion_limit == 25
@@ -326,7 +327,7 @@ def test_build_agent_installs_compactor_before_browser(
     assert returned_browser is browser
     assert isinstance(captured["middleware"][0], AgentNodeCompactionMiddleware)
     assert captured["middleware"][0].trigger_tokens == 1000
-    assert captured["middleware"][0].trigger_images == 255
+    assert captured["middleware"][0].trigger_images == 249
     assert captured["middleware"][1] is browser
     assert captured["checkpointer"] is checkpointer
 
@@ -378,16 +379,88 @@ async def test_compactor_uses_agent_model_node_without_tools_and_rewrites_state(
     assert rewritten[3].content == "以下是压缩后的历史上下文：\n\ncompressed history"
 
 
-def test_compactor_triggers_at_255_images_without_token_limit() -> None:
-    middleware = AgentNodeCompactionMiddleware(trigger_tokens=1_000_000, trigger_images=255)
-    images = [ToolMessage(content=[{"type": "image", "base64": "a"}], tool_call_id=str(i)) for i in range(255)]
+def test_compactor_triggers_at_249_images_without_token_limit() -> None:
+    middleware = AgentNodeCompactionMiddleware(trigger_tokens=1_000_000, trigger_images=249)
+    images = [ToolMessage(content=[{"type": "image", "base64": "a"}], tool_call_id=str(i)) for i in range(249)]
     messages = [resume_message("resume"), task_message("task"), *images]
 
     assert middleware.before_agent({"messages": messages[:-1]}, None) is None
-    update = middleware.before_agent({"messages": messages}, None)
+    update = middleware.before_model({"messages": messages}, None)
     assert update is not None
     assert update["messages"][0].content == COMPACTION_PROMPT
     assert middleware.before_agent({"messages": [*messages, *update["messages"]]}, None) is None
+
+
+def test_compactor_limits_existing_oversized_checkpoint_before_model() -> None:
+    middleware = AgentNodeCompactionMiddleware(trigger_tokens=1_000_000, trigger_images=255)
+    images = [
+        ToolMessage(
+            content=[{"type": "text", "text": f"result {i}"}, {"type": "image", "base64": "a"}],
+            id=f"message-{i}",
+            tool_call_id=str(i),
+        )
+        for i in range(251)
+    ]
+    messages = [resume_message("resume"), task_message("task"), *images]
+
+    update = middleware.before_model({"messages": messages}, None)
+
+    assert update is not None
+    replacements = update["messages"][:-1]
+    assert len(replacements) == 2
+    assert [replacement.id for replacement in replacements] == [images[0].id, images[1].id]
+    assert all(replacement.content == [{"type": "text", "text": f"result {i}"}]
+               for i, replacement in enumerate(replacements))
+    assert update["messages"][-1].content == COMPACTION_PROMPT
+    merged = add_messages(messages, update["messages"])
+    assert _image_count(merged) == 249
+    assert merged[-1].content == COMPACTION_PROMPT
+
+
+async def test_compactor_runs_before_model_after_tool_adds_249th_image() -> None:
+    class ToolCallingModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    @tool
+    def screenshot() -> list[dict[str, str]]:
+        """Return a page screenshot."""
+        return [{"type": "image", "base64": "YQ==", "mime_type": "image/png"}]
+
+    model = ToolCallingModel(responses=[
+        AIMessage(content="", tool_calls=[{"name": "screenshot", "args": {}, "id": "shot-1"}]),
+        AIMessage(content="compressed history"),
+        AIMessage(content="finished"),
+    ])
+    middleware = AgentNodeCompactionMiddleware(trigger_tokens=1_000_000, trigger_images=249)
+    agent = create_agent(model=model, tools=[screenshot], middleware=[middleware])
+    images = [HumanMessage(content=[{"type": "image", "base64": "YQ==", "mime_type": "image/png"}]) for _ in range(248)]
+
+    result = await agent.ainvoke({"messages": [resume_message("resume"), task_message("task"), *images]})
+
+    assert len(result["messages"]) == 4
+    assert "compressed history" in result["messages"][2].content
+    assert result["messages"][3].content == "finished"
+
+
+async def test_compactor_recovers_from_251_images_before_provider_request() -> None:
+    class ImageLimitModel(FakeMessagesListChatModel):
+        def _generate(self, messages, *args, **kwargs):
+            assert _image_count(messages) <= 249
+            return super()._generate(messages, *args, **kwargs)
+
+    model = ImageLimitModel(responses=[AIMessage(content="compressed"), AIMessage(content="done")])
+    agent = create_agent(
+        model=model,
+        middleware=[AgentNodeCompactionMiddleware(trigger_tokens=1_000_000, trigger_images=249)],
+    )
+    images = [HumanMessage(content=[{"type": "image", "base64": "YQ==", "mime_type": "image/png"}]) for _ in range(251)]
+
+    result = await agent.ainvoke({"messages": [resume_message("resume"), task_message("task"), *images]})
+
+    assert len(result["messages"]) == 4
+    assert "compressed" in result["messages"][2].content
+    assert result["messages"][3].content == "done"
 
 
 async def test_compactor_rejects_tool_calls_from_compression_model_node() -> None:
