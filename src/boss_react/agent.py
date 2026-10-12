@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 
 from .agent_config import AgentSettings, read_required_text
 from .context_compaction import AgentNodeCompactionMiddleware, resume_message, task_message
+from .latest_image import LatestImageMiddleware
 from .nodriver import NodriverBrowserConfig
 from .nodriver_middleware import BossReactMiddleware
 
@@ -105,7 +106,7 @@ def build_agent(
     graph = create_agent(
         model=chat_model,
         system_prompt=system_prompt,
-        middleware=[compactor, browser],
+        middleware=[LatestImageMiddleware(), compactor, browser],
         checkpointer=checkpointer,
         debug=settings.debug,
         name="boss_react_agent",

@@ -32,6 +32,7 @@ from boss_react.context_compaction import (
     resume_message,
     task_message,
 )
+from boss_react.latest_image import LatestImageMiddleware
 from boss_react.nodriver_middleware import BossReactMiddleware
 
 
@@ -291,7 +292,7 @@ def test_model_uses_local_openai_compatible_config(
     assert model.request_timeout == 300
 
 
-def test_build_agent_installs_compactor_before_browser(
+def test_build_agent_installs_image_retention_before_compactor_and_browser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = load_agent_settings(_write_config(tmp_path))
@@ -325,10 +326,11 @@ def test_build_agent_installs_compactor_before_browser(
 
     assert graph == "compiled-agent"
     assert returned_browser is browser
-    assert isinstance(captured["middleware"][0], AgentNodeCompactionMiddleware)
-    assert captured["middleware"][0].trigger_tokens == 1000
-    assert captured["middleware"][0].trigger_images == 249
-    assert captured["middleware"][1] is browser
+    assert isinstance(captured["middleware"][0], LatestImageMiddleware)
+    assert isinstance(captured["middleware"][1], AgentNodeCompactionMiddleware)
+    assert captured["middleware"][1].trigger_tokens == 1000
+    assert captured["middleware"][1].trigger_images == 249
+    assert captured["middleware"][2] is browser
     assert captured["checkpointer"] is checkpointer
 
 
